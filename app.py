@@ -34,7 +34,7 @@ def init_database():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # جدول المستخدمين (مع معلومات المكتب)
+    # جدول المستخدمين (مع معلومات المكتب والإعدادات)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +46,9 @@ def init_database():
             business_email TEXT,
             position TEXT,
             logo_path TEXT,
+            notification_enabled INTEGER DEFAULT 1,
+            discount_type TEXT DEFAULT 'percentage',
+            discount_value REAL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -59,6 +62,7 @@ def init_database():
             Prix REAL,
             Quantité REAL,
             "Code-barres" TEXT,
+            alert_threshold INTEGER DEFAULT 5,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     ''')
@@ -75,6 +79,8 @@ def init_database():
             Date TEXT,
             Nom TEXT,
             Facture TEXT,
+            Discount REAL DEFAULT 0,
+            Discount_Type TEXT DEFAULT 'percentage',
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     ''')
@@ -159,6 +165,19 @@ def init_database():
         )
     ''')
     
+    # جدول الإشعارات (مرتبط بالمستخدم)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            message TEXT,
+            type TEXT,
+            read INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    ''')
+    
     # ====== إضافة مستخدم افتراضي "version" ======
     cursor.execute('SELECT * FROM users WHERE username = ?', ('version',))
     user_exists = cursor.fetchone()
@@ -166,10 +185,10 @@ def init_database():
     if not user_exists:
         hashed_password = hash_password("123456789")
         cursor.execute('''
-            INSERT INTO users (username, password, full_name, business_name, business_phone, business_email, position, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', ('version', hashed_password, 'مدير النظام', 'مكتبي', '0612345678', 'admin@example.com', 'مدير'))
-        print("✅ تم إنشاء المستخدم version بكلمة مرور: 123456789")
+            INSERT INTO users (username, password, full_name, business_name, business_phone, business_email, position, notification_enabled, discount_type, discount_value, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', ('version', hashed_password, 'مدير النظام', 'مكتبي', '0612345678', 'admin@example.com', 'مدير', 1, 'percentage', 0))
+        print("✅ تم إنشاء المستخدم version")
     
     conn.commit()
     conn.close()
@@ -198,23 +217,23 @@ def create_user(username, password, full_name="", business_name="", business_pho
         cursor = conn.cursor()
         hashed = hash_password(password)
         cursor.execute('''
-            INSERT INTO users (username, password, full_name, business_name, business_phone, business_email, position, logo_path, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (username, hashed, full_name, business_name, business_phone, business_email, position, logo_path))
+            INSERT INTO users (username, password, full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (username, hashed, full_name, business_name, business_phone, business_email, position, logo_path, 1, 'percentage', 0))
         conn.commit()
         conn.close()
         return True
     except sqlite3.IntegrityError:
         return False
 
-def update_user_info(user_id, full_name, business_name, business_phone, business_email, position, logo_path):
+def update_user_info(user_id, full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
         UPDATE users 
-        SET full_name = ?, business_name = ?, business_phone = ?, business_email = ?, position = ?, logo_path = ?
+        SET full_name = ?, business_name = ?, business_phone = ?, business_email = ?, position = ?, logo_path = ?, notification_enabled = ?, discount_type = ?, discount_value = ?
         WHERE id = ?
-    ''', (full_name, business_name, business_phone, business_email, position, logo_path, user_id))
+    ''', (full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value, user_id))
     conn.commit()
     conn.close()
 
@@ -305,14 +324,12 @@ def clean_text_for_pdf(text):
     """تنظيف النص للاستخدام في PDF"""
     if text is None:
         return ""
-    # إزالة الأحرف غير المدعومة
     text = re.sub(r'[^\x00-\x7F]+', ' ', str(text))
-    # إزالة الأحرف الخاصة
     text = re.sub(r'[^a-zA-Z0-9\s\.\,\-\_\:\/]', '', text)
     return text.strip()
 
-def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None):
-    """إنشاء فاتورة PDF مع دعم اللغة العربية"""
+def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None, discount=0, discount_type="percentage"):
+    """إنشاء فاتورة PDF مع دعم التخفيضات"""
     try:
         invoice_number = get_next_invoice_number(user_info[0] if user_info else None)
         
@@ -320,17 +337,14 @@ def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None):
         pdf.add_page()
         pdf.set_auto_page_break(auto=True, margin=5)
         
-        # استخدام خط يدعم Unicode
         pdf.set_font("Helvetica", 'B', 14)
         
-        # شعار المكتب إذا وجد
         if user_info and user_info[8] and os.path.exists(user_info[8]):
             try:
                 pdf.image(user_info[8], x=5, y=5, w=20)
             except:
                 pass
         
-        # معلومات المكتب
         business_name = user_info[4] if user_info and user_info[4] else "Business"
         business_name_clean = clean_text_for_pdf(business_name)
         pdf.cell(70, 8, business_name_clean, ln=True, align='C')
@@ -384,6 +398,19 @@ def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None):
         
         pdf.set_font("Helvetica", 'B', 10)
         pdf.cell(70, 6, "-" * 40, ln=True, align='C')
+        
+        # حساب التخفيض
+        if discount > 0:
+            if discount_type == "percentage":
+                discount_amount = tg * (discount / 100)
+                pdf.cell(70, 6, f"Total Avant Reduction: {tg:.2f} DH", ln=True, align='R')
+                pdf.cell(70, 6, f"Reduction: {discount:.0f}% (-{discount_amount:.2f} DH)", ln=True, align='R')
+                tg = tg - discount_amount
+            else:
+                pdf.cell(70, 6, f"Total Avant Reduction: {tg:.2f} DH", ln=True, align='R')
+                pdf.cell(70, 6, f"Reduction: -{discount:.2f} DH", ln=True, align='R')
+                tg = tg - discount
+        
         pdf.cell(70, 6, f"TOTAL: {tg:.2f} DH", ln=True, align='R')
         pdf.cell(70, 4, "-" * 40, ln=True, align='C')
         
@@ -425,6 +452,8 @@ def reprint_invoice(invoice_number, user_id):
     invoice_items = df_ventes[df_ventes['Facture'] == invoice_number]
     if not invoice_items.empty:
         cart_data = []
+        discount = 0
+        discount_type = "percentage"
         for _, row in invoice_items.iterrows():
             cart_data.append({
                 "Nom": row.get('Nom', ''),
@@ -433,8 +462,12 @@ def reprint_invoice(invoice_number, user_id):
                 "Total": float(row.get('Total', 0)),
                 "Code": row.get('Code', '')
             })
+            if 'Discount' in row and row['Discount']:
+                discount = row['Discount']
+            if 'Discount_Type' in row and row['Discount_Type']:
+                discount_type = row['Discount_Type']
         user_info = get_user_info(user_id)
-        return generate_facture_80mm(cart_data, "FACTURE DUPLICATA", user_info)
+        return generate_facture_80mm(cart_data, "FACTURE DUPLICATA", user_info, discount, discount_type)
     return None, None
 
 def get_product_info(code_or_name, user_id):
@@ -451,15 +484,45 @@ def get_product_info(code_or_name, user_id):
     conn.close()
     
     if product:
-        columns = ['id', 'user_id', 'Nom', 'Prix', 'Quantité', 'Code-barres']
+        columns = ['id', 'user_id', 'Nom', 'Prix', 'Quantité', 'Code-barres', 'alert_threshold']
         return dict(zip(columns, product))
     return None
 
 def check_stock_levels(user_id):
     df = get_df("stock", user_id)
     if not df.empty and 'Quantité' in df.columns:
-        return df[df['Quantité'] < 5]
+        threshold = 5
+        return df[df['Quantité'] < threshold]
     return pd.DataFrame()
+
+def check_and_create_notifications(user_id):
+    """التحقق من المخزون وإنشاء إشعارات إذا لزم الأمر"""
+    df_stock = get_df("stock", user_id)
+    notifications = []
+    
+    if not df_stock.empty and 'Quantité' in df_stock.columns:
+        low_stock = df_stock[df_stock['Quantité'] < df_stock.get('alert_threshold', 5)]
+        for _, row in low_stock.iterrows():
+            notifications.append(f"⚠️ المخزون منخفض: {row['Nom']} - المتوفر: {row['Quantité']}")
+    
+    # حفظ الإشعارات في قاعدة البيانات
+    for msg in notifications:
+        save_to_table("notifications", {
+            "message": msg,
+            "type": "stock_alert",
+            "read": 0
+        }, user_id)
+    
+    return notifications
+
+def get_notifications(user_id):
+    df = get_df("notifications", user_id)
+    if not df.empty:
+        return df[df['read'] == 0]
+    return pd.DataFrame()
+
+def mark_notification_read(notification_id, user_id):
+    update_table("notifications", {"read": 1}, notification_id, user_id)
 
 def confirm_purchase(cmd_id, user_id):
     conn = get_connection()
@@ -646,9 +709,9 @@ translations = {
         "en": "❌ Passwords do not match"
     },
     "business_info": {
-        "ar": "🏢 معلومات المكتب",
-        "fr": "🏢 Informations du bureau",
-        "en": "🏢 Business Information"
+        "ar": "🏢 معلومات المكتب والإعدادات",
+        "fr": "🏢 Informations du bureau et paramètres",
+        "en": "🏢 Business Information & Settings"
     },
     "business_name_label": {
         "ar": "اسم المكتب:",
@@ -675,15 +738,50 @@ translations = {
         "fr": "Logo:",
         "en": "Logo:"
     },
+    "discount_settings": {
+        "ar": "💰 إعدادات التخفيضات",
+        "fr": "💰 Paramètres de réduction",
+        "en": "💰 Discount Settings"
+    },
+    "discount_type_label": {
+        "ar": "نوع التخفيض:",
+        "fr": "Type de réduction:",
+        "en": "Discount Type:"
+    },
+    "discount_percentage": {
+        "ar": "نسبة مئوية (%)",
+        "fr": "Pourcentage (%)",
+        "en": "Percentage (%)"
+    },
+    "discount_fixed": {
+        "ar": "مبلغ ثابت (DH)",
+        "fr": "Montant fixe (DH)",
+        "en": "Fixed Amount (DH)"
+    },
+    "discount_value_label": {
+        "ar": "قيمة التخفيض:",
+        "fr": "Valeur de la réduction:",
+        "en": "Discount Value:"
+    },
+    "notification_settings": {
+        "ar": "🔔 إعدادات الإشعارات",
+        "fr": "🔔 Paramètres de notifications",
+        "en": "🔔 Notification Settings"
+    },
+    "enable_notifications": {
+        "ar": "تفعيل الإشعارات",
+        "fr": "Activer les notifications",
+        "en": "Enable Notifications"
+    },
     "update_info_button": {
-        "ar": "💾 تحديث المعلومات",
-        "fr": "💾 Mettre à jour les informations",
-        "en": "💾 Update Information"
+        "ar": "💾 تحديث المعلومات والإعدادات",
+        "fr": "💾 Mettre à jour les informations et paramètres",
+        "en": "💾 Update Information & Settings"
     },
     "info_updated": {
-        "ar": "✅ تم تحديث المعلومات بنجاح!",
-        "fr": "✅ Informations mises à jour avec succès!",
-        "en": "✅ Information updated successfully!"
+        "ar": "✅ تم تحديث المعلومات والإعدادات بنجاح!",
+        "fr": "✅ Informations et paramètres mis à jour avec succès!",
+        "en": "✅ Information & Settings updated successfully!"
     },
     "menu_main": {
         "ar": "القائمة الرئيسية",
@@ -2120,12 +2218,15 @@ with st.sidebar:
     if st.session_state.show_business_info:
         st.subheader(t("business_info"))
         user = st.session_state.user_info
+        
+        # معلومات المكتب
         new_fullname = st.text_input(t("full_name_label"), value=user[3] if user[3] else "", key="edit_fullname")
         new_business_name = st.text_input(t("business_name_label"), value=user[4] if user[4] else "", key="edit_business_name")
         new_business_phone = st.text_input(t("business_phone_label"), value=user[5] if user[5] else "", key="edit_business_phone")
         new_business_email = st.text_input(t("business_email_label"), value=user[6] if user[6] else "", key="edit_business_email")
         new_position = st.text_input(t("position_label"), value=user[7] if user[7] else "", key="edit_position")
         
+        # الشعار
         uploaded_logo = st.file_uploader(t("logo_label"), type=["png", "jpg", "jpeg"], key="logo_upload")
         logo_path = user[8] if user[8] else ""
         
@@ -2137,8 +2238,50 @@ with st.sidebar:
             with open(logo_path, "wb") as f:
                 f.write(uploaded_logo.getbuffer())
         
+        st.divider()
+        
+        # ====== إعدادات التخفيضات ======
+        st.subheader(t("discount_settings"))
+        discount_type = st.selectbox(
+            t("discount_type_label"),
+            ["percentage", "fixed"],
+            index=0 if user[10] == "percentage" else 1,
+            key="edit_discount_type"
+        )
+        discount_value = st.number_input(
+            t("discount_value_label"),
+            min_value=0.0,
+            max_value=100.0 if discount_type == "percentage" else 10000.0,
+            value=float(user[11]) if user[11] else 0.0,
+            step=1.0,
+            key="edit_discount_value"
+        )
+        
+        st.divider()
+        
+        # ====== إعدادات الإشعارات ======
+        st.subheader(t("notification_settings"))
+        notification_enabled = st.checkbox(
+            t("enable_notifications"),
+            value=bool(user[9]) if user[9] else True,
+            key="edit_notification_enabled"
+        )
+        
+        st.divider()
+        
         if st.button(t("update_info_button"), use_container_width=True):
-            update_user_info(st.session_state.user_id, new_fullname, new_business_name, new_business_phone, new_business_email, new_position, logo_path)
+            update_user_info(
+                st.session_state.user_id,
+                new_fullname,
+                new_business_name,
+                new_business_phone,
+                new_business_email,
+                new_position,
+                logo_path,
+                1 if notification_enabled else 0,
+                discount_type,
+                discount_value
+            )
             st.session_state.user_info = get_user_info(st.session_state.user_id)
             st.success(t("info_updated"))
             st.rerun()
@@ -2158,6 +2301,19 @@ with st.sidebar:
         t("outils")
     ]
     menu = st.selectbox(t("menu_main"), menu_options)
+    
+    st.divider()
+    
+    # ====== عرض الإشعارات ======
+    if st.session_state.authenticated:
+        notifications = get_notifications(st.session_state.user_id)
+        if not notifications.empty:
+            st.warning(f"🔔 {len(notifications)} إشعار جديد")
+            for _, notif in notifications.iterrows():
+                st.info(notif['message'])
+                if st.button(f"✅ تم القراءة", key=f"read_{notif['id']}"):
+                    mark_notification_read(notif['id'], st.session_state.user_id)
+                    st.rerun()
     
     st.divider()
     
@@ -2213,6 +2369,61 @@ if menu == t("dashboard"):
         st.metric("📦 المنتجات", len(df_s))
     with col4:
         st.metric("⚠️ مخزون منخفض", low_stock)
+    
+    st.divider()
+    
+    # ====== التقارير المتقدمة ======
+    st.subheader("📊 التقارير المتقدمة")
+    
+    report_type = st.selectbox(
+        "نوع التقرير",
+        ["يومي", "شهري", "سنوي", "مخصص"],
+        key="report_type"
+    )
+    
+    if report_type == "يومي":
+        date_selected = st.date_input("اختر التاريخ", value=datetime.now())
+        df_filtered = df_v[df_v['Date'].str.contains(date_selected.strftime('%d/%m/%Y'), na=False)]
+    elif report_type == "شهري":
+        month_selected = st.selectbox("اختر الشهر", range(1, 13))
+        year_selected = st.selectbox("اختر السنة", range(2020, datetime.now().year + 1))
+        df_filtered = df_v[df_v['Date'].str.contains(f"{month_selected:02d}/{year_selected}", na=False)]
+    elif report_type == "سنوي":
+        year_selected = st.selectbox("اختر السنة", range(2020, datetime.now().year + 1))
+        df_filtered = df_v[df_v['Date'].str.contains(f"{year_selected}", na=False)]
+    else:  # مخصص
+        date_start = st.date_input("من", value=datetime.now() - timedelta(days=30))
+        date_end = st.date_input("إلى", value=datetime.now())
+        df_v['Date_dt'] = pd.to_datetime(df_v['Date'], format='%d/%m/%Y %H:%M', errors='coerce')
+        df_filtered = df_v[(df_v['Date_dt'].dt.date >= date_start) & (df_v['Date_dt'].dt.date <= date_end)]
+    
+    if not df_filtered.empty:
+        total_report = df_filtered['Total'].sum() if 'Total' in df_filtered.columns else 0
+        st.metric("💰 إجمالي المبيعات", f"{total_report:.2f} DH")
+        
+        # رسم بياني للمبيعات
+        if 'Date' in df_filtered.columns:
+            df_filtered['Date_dt'] = pd.to_datetime(df_filtered['Date'], format='%d/%m/%Y %H:%M', errors='coerce')
+            daily_sales_report = df_filtered.groupby(df_filtered['Date_dt'].dt.date)['Total'].sum().reset_index()
+            daily_sales_report.columns = ['التاريخ', 'المبيعات']
+            fig = px.bar(daily_sales_report, x='التاريخ', y='المبيعات', title="المبيعات خلال الفترة")
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # أفضل المنتجات
+        top_products_report = df_filtered.groupby('Nom')['Total'].sum().sort_values(ascending=False).head(10)
+        if not top_products_report.empty:
+            fig2 = px.pie(values=top_products_report.values, names=top_products_report.index, title="توزيع المبيعات حسب المنتج")
+            st.plotly_chart(fig2, use_container_width=True)
+        
+        # تصدير التقرير
+        st.download_button(
+            "📥 تحميل التقرير (Excel)",
+            data=to_excel(df_filtered),
+            file_name=f"rapport_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("لا توجد بيانات لهذه الفترة")
     
     st.divider()
     
@@ -2292,6 +2503,10 @@ if menu == t("pos"):
     user_id = st.session_state.user_id
     user_info = st.session_state.user_info
     
+    # الحصول على إعدادات التخفيض من المستخدم
+    user_discount_type = user_info[10] if user_info and len(user_info) > 10 else "percentage"
+    user_discount_value = user_info[11] if user_info and len(user_info) > 11 else 0
+    
     with st.expander(t("voice_command"), expanded=False):
         voice_command_component()
     
@@ -2299,6 +2514,25 @@ if menu == t("pos"):
         t("auto_sale_mode"),
         value=st.session_state.auto_sale_mode
     )
+    
+    # إضافة خيار التخفيض
+    discount_enabled = st.checkbox("💰 تطبيق تخفيض", value=False)
+    discount_type = "percentage"
+    discount_value = 0
+    
+    if discount_enabled:
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            discount_type = st.selectbox(
+                "نوع التخفيض",
+                ["percentage", "fixed"],
+                index=0 if user_discount_type == "percentage" else 1
+            )
+        with col_d2:
+            if discount_type == "percentage":
+                discount_value = st.slider("نسبة التخفيض (%)", 0, 100, int(user_discount_value if user_discount_value else 0))
+            else:
+                discount_value = st.number_input("قيمة التخفيض (DH)", min_value=0.0, max_value=10000.0, value=float(user_discount_value if user_discount_value else 0))
     
     if st.session_state.auto_sale_mode:
         st.success("⚡ Mode Auto: Scannez un produit = Vente directe + Facture 80mm imprimée automatiquement")
@@ -2320,7 +2554,13 @@ if menu == t("pos"):
                 if float(product['Quantité']) >= 1:
                     total = float(product['Prix'])
                     
-                    facture_result = generate_facture_80mm([{"Nom": product.get('Nom', code_auto), "Quantité": 1, "Prix": float(product['Prix']), "Total": total}], "FACTURE DE VENTE", user_info)
+                    facture_result = generate_facture_80mm(
+                        [{"Nom": product.get('Nom', code_auto), "Quantité": 1, "Prix": float(product['Prix']), "Total": total}],
+                        "FACTURE DE VENTE",
+                        user_info,
+                        discount_value if discount_enabled else 0,
+                        discount_type if discount_enabled else "percentage"
+                    )
                     if facture_result:
                         facture_path, invoice_number = facture_result
                         
@@ -2328,10 +2568,12 @@ if menu == t("pos"):
                             "Code": code_auto,
                             "Quantité": 1.0,
                             "Prix": float(product['Prix']),
-                            "Total": total,
+                            "Total": total - (total * (discount_value/100) if discount_type == "percentage" and discount_enabled else discount_value if discount_enabled else 0),
                             "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
                             "Nom": product.get('Nom', code_auto),
-                            "Facture": invoice_number
+                            "Facture": invoice_number,
+                            "Discount": discount_value if discount_enabled else 0,
+                            "Discount_Type": discount_type if discount_enabled else "percentage"
                         }, user_id)
                         
                         update_table("stock", {
@@ -2394,23 +2636,38 @@ if menu == t("pos"):
                         if q_old >= qty:
                             total = prix * qty
                             
-                            facture_result = generate_facture_80mm([{"Nom": nom, "Quantité": qty, "Prix": prix, "Total": total}], "FACTURE DE VENTE", user_info)
+                            facture_result = generate_facture_80mm(
+                                [{"Nom": nom, "Quantité": qty, "Prix": prix, "Total": total}],
+                                "FACTURE DE VENTE",
+                                user_info,
+                                discount_value if discount_enabled else 0,
+                                discount_type if discount_enabled else "percentage"
+                            )
                             if facture_result:
                                 facture_path, invoice_number = facture_result
+                                
+                                final_total = total
+                                if discount_enabled:
+                                    if discount_type == "percentage":
+                                        final_total = total - (total * (discount_value / 100))
+                                    else:
+                                        final_total = total - discount_value
                                 
                                 save_to_table("ventes", {
                                     "Code": code, 
                                     "Quantité": qty, 
                                     "Prix": prix, 
-                                    "Total": total, 
+                                    "Total": final_total,
                                     "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
                                     "Nom": nom,
-                                    "Facture": invoice_number
+                                    "Facture": invoice_number,
+                                    "Discount": discount_value if discount_enabled else 0,
+                                    "Discount_Type": discount_type if discount_enabled else "percentage"
                                 }, user_id)
                                 
                                 update_table("stock", {"Quantité": q_old - qty}, doc_id, user_id)
                                 play_success_sound()
-                                st.success(f"{t('sale_success')} {nom} - {total:.2f} DH | Facture: {invoice_number}")
+                                st.success(f"{t('sale_success')} {nom} - {final_total:.2f} DH | Facture: {invoice_number}")
                                 st.rerun()
                             else:
                                 st.error("❌ حدث خطأ في إنشاء الفاتورة")
@@ -2491,23 +2748,38 @@ if menu == t("pos"):
                         if q_old >= qty_qr:
                             total = prix * qty_qr
                             
-                            facture_result = generate_facture_80mm([{"Nom": nom, "Quantité": qty_qr, "Prix": prix, "Total": total}], "FACTURE DE VENTE", user_info)
+                            facture_result = generate_facture_80mm(
+                                [{"Nom": nom, "Quantité": qty_qr, "Prix": prix, "Total": total}],
+                                "FACTURE DE VENTE",
+                                user_info,
+                                discount_value if discount_enabled else 0,
+                                discount_type if discount_enabled else "percentage"
+                            )
                             if facture_result:
                                 facture_path, invoice_number = facture_result
+                                
+                                final_total = total
+                                if discount_enabled:
+                                    if discount_type == "percentage":
+                                        final_total = total - (total * (discount_value / 100))
+                                    else:
+                                        final_total = total - discount_value
                                 
                                 save_to_table("ventes", {
                                     "Code": code_qr,
                                     "Quantité": qty_qr,
                                     "Prix": prix,
-                                    "Total": total,
+                                    "Total": final_total,
                                     "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
                                     "Nom": nom,
-                                    "Facture": invoice_number
+                                    "Facture": invoice_number,
+                                    "Discount": discount_value if discount_enabled else 0,
+                                    "Discount_Type": discount_type if discount_enabled else "percentage"
                                 }, user_id)
                                 
                                 update_table("stock", {"Quantité": q_old - qty_qr}, doc_id, user_id)
                                 play_success_sound()
-                                st.success(f"✅ {t('sale_success')} {nom} - {qty_qr} x {prix} = {total:.2f} DH | 🧾 Facture: {invoice_number}")
+                                st.success(f"✅ {t('sale_success')} {nom} - {qty_qr} x {prix} = {final_total:.2f} DH | 🧾 Facture: {invoice_number}")
                                 st.rerun()
                             else:
                                 st.error("❌ حدث خطأ في إنشاء الفاتورة")
@@ -2534,21 +2806,36 @@ if menu == t("pos"):
                 if name and price > 0:
                     total_libre = float(price) * qty_libre
                     
-                    facture_result = generate_facture_80mm([{"Nom": name, "Quantité": qty_libre, "Prix": float(price), "Total": total_libre}], "FACTURE DE VENTE", user_info)
+                    facture_result = generate_facture_80mm(
+                        [{"Nom": name, "Quantité": qty_libre, "Prix": float(price), "Total": total_libre}],
+                        "FACTURE DE VENTE",
+                        user_info,
+                        discount_value if discount_enabled else 0,
+                        discount_type if discount_enabled else "percentage"
+                    )
                     if facture_result:
                         facture_path, invoice_number = facture_result
+                        
+                        final_total = total_libre
+                        if discount_enabled:
+                            if discount_type == "percentage":
+                                final_total = total_libre - (total_libre * (discount_value / 100))
+                            else:
+                                final_total = total_libre - discount_value
                         
                         save_to_table("ventes", {
                             "Code": name, 
                             "Quantité": qty_libre, 
                             "Prix": float(price), 
-                            "Total": total_libre, 
+                            "Total": final_total,
                             "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
                             "Nom": name,
-                            "Facture": invoice_number
+                            "Facture": invoice_number,
+                            "Discount": discount_value if discount_enabled else 0,
+                            "Discount_Type": discount_type if discount_enabled else "percentage"
                         }, user_id)
                         play_success_sound()
-                        st.success(f"{t('sale_success')} {name} - {qty_libre} x {price} = {total_libre:.2f} DH | Facture: {invoice_number}")
+                        st.success(f"{t('sale_success')} {name} - {qty_libre} x {price} = {final_total:.2f} DH | Facture: {invoice_number}")
                         st.rerun()
                     else:
                         st.error("❌ حدث خطأ في إنشاء الفاتورة")
@@ -2617,15 +2904,30 @@ if menu == t("pos"):
                                         "Quantité": float(product['Quantité']) - item['Quantité']
                                     }, product['id'], user_id)
                             
-                            facture_result = generate_facture_80mm(st.session_state.cart, "FACTURE DE VENTE", user_info)
+                            facture_result = generate_facture_80mm(
+                                st.session_state.cart,
+                                "FACTURE DE VENTE",
+                                user_info,
+                                discount_value if discount_enabled else 0,
+                                discount_type if discount_enabled else "percentage"
+                            )
                             if facture_result:
                                 facture_path, invoice_number = facture_result
+                                
+                                final_total = total_panier
+                                if discount_enabled:
+                                    if discount_type == "percentage":
+                                        final_total = total_panier - (total_panier * (discount_value / 100))
+                                    else:
+                                        final_total = total_panier - discount_value
                                 
                                 for item in st.session_state.cart:
                                     save_to_table("ventes", {
                                         **item,
                                         "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
-                                        "Facture": invoice_number
+                                        "Facture": invoice_number,
+                                        "Discount": discount_value if discount_enabled else 0,
+                                        "Discount_Type": discount_type if discount_enabled else "percentage"
                                     }, user_id)
                                 
                                 st.session_state.last_cart = st.session_state.cart.copy()
@@ -2719,7 +3021,13 @@ if menu == t("pos"):
                                     "Quantité": float(product['Quantité']) - item['Quantité']
                                 }, product['id'], user_id)
                             
-                        facture_result = generate_facture_80mm(st.session_state.cart, "FACTURE DE VENTE", user_info)
+                        facture_result = generate_facture_80mm(
+                            st.session_state.cart,
+                            "FACTURE DE VENTE",
+                            user_info,
+                            discount_value if discount_enabled else 0,
+                            discount_type if discount_enabled else "percentage"
+                        )
                         if facture_result:
                             facture_path, invoice_number = facture_result
                             
@@ -2727,7 +3035,9 @@ if menu == t("pos"):
                                 save_to_table("ventes", {
                                     **item,
                                     "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
-                                    "Facture": invoice_number
+                                    "Facture": invoice_number,
+                                    "Discount": discount_value if discount_enabled else 0,
+                                    "Discount_Type": discount_type if discount_enabled else "percentage"
                                 }, user_id)
                             
                             st.session_state.last_cart = st.session_state.cart.copy()
@@ -2803,9 +3113,9 @@ elif menu == t("stock"):
                     conn = get_connection()
                     cursor = conn.cursor()
                     cursor.execute('''
-                        INSERT INTO stock (user_id, Nom, Prix, Quantité, "Code-barres")
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (user_id, name, float(price), float(qty), barcode if barcode else ""))
+                        INSERT INTO stock (user_id, Nom, Prix, Quantité, "Code-barres", alert_threshold)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (user_id, name, float(price), float(qty), barcode if barcode else "", 5))
                     conn.commit()
                     conn.close()
                     st.success(t("product_added"))
@@ -3179,9 +3489,14 @@ elif menu == t("factures"):
     df_invoices = get_all_invoices(user_id)
     
     if not df_invoices.empty:
-        invoices_display = df_invoices[['Facture', 'Nom', 'Quantité', 'Prix', 'Total', 'Date']].copy()
+        invoices_display = df_invoices[['Facture', 'Nom', 'Quantité', 'Prix', 'Total', 'Date', 'Discount', 'Discount_Type']].copy()
         invoices_display = invoices_display.drop_duplicates(subset=['Facture'])
-        st.dataframe(invoices_display, use_container_width=True)
+        # إضافة عمود التخفيض
+        invoices_display['تخفيض'] = invoices_display.apply(
+            lambda x: f"{x['Discount']}{'%' if x['Discount_Type'] == 'percentage' else ' DH'}" if x['Discount'] > 0 else "بدون",
+            axis=1
+        )
+        st.dataframe(invoices_display[['Facture', 'Nom', 'Total', 'تخفيض', 'Date']], use_container_width=True)
         
         st.divider()
         st.subheader("🖨️ " + t("reprint_invoice"))
