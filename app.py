@@ -16,6 +16,9 @@ import base64
 from PIL import Image
 import sys
 import re
+import shutil
+import zipfile
+from pathlib import Path
 
 # ==================== تعيين الترميز ==================== #
 if sys.stdout.encoding != 'utf-8':
@@ -25,6 +28,7 @@ if sys.stderr.encoding != 'utf-8':
 
 # ==================== إعداد SQLite ==================== #
 DB_NAME = "business_management.db"
+BACKUP_DIR = "backups"
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
@@ -174,6 +178,36 @@ def init_database():
             type TEXT,
             read INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # جدول الجرد الدوري (مرتبط بالمستخدم)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            product_id INTEGER,
+            product_name TEXT,
+            system_quantity REAL,
+            physical_quantity REAL,
+            difference REAL,
+            date TEXT,
+            status TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    ''')
+    
+    # جدول التحليل المالي (مرتبط بالمستخدم)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS financial_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            date TEXT,
+            total_sales REAL,
+            total_expenses REAL,
+            total_profit REAL,
+            profit_margin REAL,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
     ''')
@@ -399,7 +433,6 @@ def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None, discount=0
         pdf.set_font("Helvetica", 'B', 10)
         pdf.cell(70, 6, "-" * 40, ln=True, align='C')
         
-        # حساب التخفيض
         if discount > 0:
             if discount_type == "percentage":
                 discount_amount = tg * (discount / 100)
@@ -491,8 +524,7 @@ def get_product_info(code_or_name, user_id):
 def check_stock_levels(user_id):
     df = get_df("stock", user_id)
     if not df.empty and 'Quantité' in df.columns:
-        threshold = 5
-        return df[df['Quantité'] < threshold]
+        return df[df['Quantité'] < 5]
     return pd.DataFrame()
 
 def check_and_create_notifications(user_id):
@@ -505,7 +537,6 @@ def check_and_create_notifications(user_id):
         for _, row in low_stock.iterrows():
             notifications.append(f"⚠️ المخزون منخفض: {row['Nom']} - المتوفر: {row['Quantité']}")
     
-    # حفظ الإشعارات في قاعدة البيانات
     for msg in notifications:
         save_to_table("notifications", {
             "message": msg,
@@ -637,6 +668,159 @@ def play_success_sound():
     </audio>
     """
     components.html(sound_html, height=0)
+
+# ==================== دوال التخزين السحابي ==================== #
+def create_backup(user_id):
+    """إنشاء نسخة احتياطية من قاعدة البيانات"""
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_file = os.path.join(BACKUP_DIR, f"backup_{user_id}_{timestamp}.db")
+    
+    try:
+        shutil.copy2(DB_NAME, backup_file)
+        # إنشاء ملف ZIP للنسخ الاحتياطي
+        zip_file = f"{backup_file}.zip"
+        with zipfile.ZipFile(zip_file, 'w') as zipf:
+            zipf.write(backup_file, os.path.basename(backup_file))
+        os.remove(backup_file)
+        return zip_file
+    except Exception as e:
+        st.error(f"❌ خطأ في إنشاء النسخ الاحتياطي: {str(e)}")
+        return None
+
+def restore_backup(zip_file, user_id):
+    """استعادة نسخة احتياطية"""
+    try:
+        # استخراج الملف من ZIP
+        with zipfile.ZipFile(zip_file, 'r') as zipf:
+            zipf.extractall("temp_restore")
+        
+        # العثور على ملف قاعدة البيانات المستخرج
+        extracted_files = os.listdir("temp_restore")
+        db_file = None
+        for f in extracted_files:
+            if f.endswith('.db'):
+                db_file = os.path.join("temp_restore", f)
+                break
+        
+        if db_file:
+            # استعادة قاعدة البيانات
+            shutil.copy2(db_file, DB_NAME)
+            # تنظيف الملفات المؤقتة
+            shutil.rmtree("temp_restore")
+            return True
+        return False
+    except Exception as e:
+        st.error(f"❌ خطأ في استعادة النسخ الاحتياطي: {str(e)}")
+        return False
+
+def get_backup_files(user_id):
+    """الحصول على قائمة ملفات النسخ الاحتياطي"""
+    backups = []
+    if os.path.exists(BACKUP_DIR):
+        for f in os.listdir(BACKUP_DIR):
+            if f.startswith(f"backup_{user_id}") and f.endswith('.zip'):
+                file_path = os.path.join(BACKUP_DIR, f)
+                file_size = os.path.getsize(file_path) / 1024  # KB
+                file_date = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime('%d/%m/%Y %H:%M')
+                backups.append({
+                    'name': f,
+                    'path': file_path,
+                    'size': f"{file_size:.1f} KB",
+                    'date': file_date
+                })
+    return sorted(backups, key=lambda x: x['date'], reverse=True)
+
+# ==================== دوال الجرد الدوري ==================== #
+def create_inventory_check(user_id):
+    """إنشاء جرد دوري جديد"""
+    df_stock = get_df("stock", user_id)
+    if not df_stock.empty:
+        today = datetime.now().strftime('%d/%m/%Y %H:%M')
+        for _, row in df_stock.iterrows():
+            save_to_table("inventory", {
+                "product_id": row['id'],
+                "product_name": row['Nom'],
+                "system_quantity": row['Quantité'],
+                "physical_quantity": row['Quantité'],  # سيتم تحديثها يدوياً
+                "difference": 0,
+                "date": today,
+                "status": "pending"
+            }, user_id)
+        return True
+    return False
+
+def update_inventory_physical(inventory_id, physical_qty, user_id):
+    """تحديث الكمية الفعلية في الجرد"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM inventory WHERE id = ? AND user_id = ?', (inventory_id, user_id))
+    item = cursor.fetchone()
+    if item:
+        diff = physical_qty - item[4]  # system_quantity
+        cursor.execute('''
+            UPDATE inventory 
+            SET physical_quantity = ?, difference = ?, status = 'completed'
+            WHERE id = ? AND user_id = ?
+        ''', (physical_qty, diff, inventory_id, user_id))
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+def get_inventory_report(user_id):
+    """الحصول على تقرير الجرد"""
+    df = get_df("inventory", user_id)
+    if not df.empty:
+        # حساب الفروقات
+        df['difference'] = df['physical_quantity'] - df['system_quantity']
+        return df
+    return pd.DataFrame()
+
+# ==================== دوال التحليل المالي ==================== #
+def calculate_financial_analysis(user_id, period="month"):
+    """حساب التحليل المالي"""
+    df_ventes = get_df("ventes", user_id)
+    df_impressions = get_df("impressions", user_id)
+    
+    if df_ventes.empty:
+        return None
+    
+    # حساب إجمالي المبيعات
+    total_sales = df_ventes['Total'].sum() if 'Total' in df_ventes.columns else 0
+    
+    # حساب إجمالي المصروفات (الطباعة والخدمات)
+    total_expenses = df_impressions['Total'].sum() if not df_impressions.empty and 'Total' in df_impressions.columns else 0
+    
+    # حساب الأرباح
+    total_profit = total_sales - total_expenses
+    
+    # حساب هامش الربح
+    profit_margin = (total_profit / total_sales * 100) if total_sales > 0 else 0
+    
+    return {
+        'total_sales': total_sales,
+        'total_expenses': total_expenses,
+        'total_profit': total_profit,
+        'profit_margin': profit_margin
+    }
+
+def save_financial_analysis(user_id):
+    """حفظ التحليل المالي في قاعدة البيانات"""
+    analysis = calculate_financial_analysis(user_id)
+    if analysis:
+        save_to_table("financial_analysis", {
+            "date": datetime.now().strftime('%d/%m/%Y %H:%M'),
+            "total_sales": analysis['total_sales'],
+            "total_expenses": analysis['total_expenses'],
+            "total_profit": analysis['total_profit'],
+            "profit_margin": analysis['profit_margin']
+        }, user_id)
+        return True
+    return False
 
 # ==================== نظام الترجمة ==================== #
 if "lang" not in st.session_state:
@@ -1582,6 +1766,71 @@ translations = {
         "ar": "ℹ️ لا توجد فواتير مسجلة",
         "fr": "ℹ️ Aucune facture enregistrée",
         "en": "ℹ️ No invoices recorded"
+    },
+    "inventory_management": {
+        "ar": "📋 الجرد الدوري",
+        "fr": "📋 Inventaire périodique",
+        "en": "📋 Periodic Inventory"
+    },
+    "financial_analysis": {
+        "ar": "📊 التحليل المالي",
+        "fr": "📊 Analyse financière",
+        "en": "📊 Financial Analysis"
+    },
+    "backup_restore": {
+        "ar": "💾 النسخ الاحتياطي",
+        "fr": "💾 Sauvegarde",
+        "en": "💾 Backup & Restore"
+    },
+    "create_backup": {
+        "ar": "📤 إنشاء نسخة احتياطية",
+        "fr": "📤 Créer une sauvegarde",
+        "en": "📤 Create Backup"
+    },
+    "restore_backup": {
+        "ar": "📥 استعادة نسخة احتياطية",
+        "fr": "📥 Restaurer une sauvegarde",
+        "en": "📥 Restore Backup"
+    },
+    "backup_created": {
+        "ar": "✅ تم إنشاء النسخة الاحتياطية بنجاح!",
+        "fr": "✅ Sauvegarde créée avec succès!",
+        "en": "✅ Backup created successfully!"
+    },
+    "backup_restored": {
+        "ar": "✅ تم استعادة النسخة الاحتياطية بنجاح!",
+        "fr": "✅ Sauvegarde restaurée avec succès!",
+        "en": "✅ Backup restored successfully!"
+    },
+    "start_inventory": {
+        "ar": "🔍 بدء جرد جديد",
+        "fr": "🔍 Démarrer un nouvel inventaire",
+        "en": "🔍 Start New Inventory"
+    },
+    "inventory_started": {
+        "ar": "✅ تم بدء الجرد الجديد!",
+        "fr": "✅ Nouvel inventaire démarré!",
+        "en": "✅ New inventory started!"
+    },
+    "inventory_report": {
+        "ar": "📋 تقرير الجرد",
+        "fr": "📋 Rapport d'inventaire",
+        "en": "📋 Inventory Report"
+    },
+    "profit_margin": {
+        "ar": "هامش الربح",
+        "fr": "Marge bénéficiaire",
+        "en": "Profit Margin"
+    },
+    "total_expenses": {
+        "ar": "إجمالي المصروفات",
+        "fr": "Total des dépenses",
+        "en": "Total Expenses"
+    },
+    "total_profit": {
+        "ar": "إجمالي الأرباح",
+        "fr": "Total des bénéfices",
+        "en": "Total Profit"
     }
 }
 
@@ -1640,6 +1889,42 @@ def export_import_buttons(table_name, data_df, user_id):
                     st.rerun()
 
 st.set_page_config(layout="wide", page_title="Gestion d'Entreprise")
+
+# ==================== عرض معلومات المكتب في أعلى الصفحة ==================== #
+def display_business_header(user_info):
+    """عرض معلومات المكتب في أعلى الصفحة"""
+    if user_info:
+        col1, col2, col3, col4 = st.columns([1, 2, 2, 1])
+        
+        with col1:
+            if user_info[8] and os.path.exists(user_info[8]):
+                try:
+                    st.image(user_info[8], width=60)
+                except:
+                    pass
+        
+        with col2:
+            business_name = user_info[4] if user_info[4] else "اسم المكتب"
+            full_name = user_info[3] if user_info[3] else ""
+            st.markdown(f"### 🏢 {business_name}")
+            if full_name:
+                st.markdown(f"👤 **{full_name}**")
+        
+        with col3:
+            phone = user_info[5] if user_info[5] else ""
+            email = user_info[6] if user_info[6] else ""
+            if phone:
+                st.markdown(f"📞 {phone}")
+            if email:
+                st.markdown(f"📧 {email}")
+        
+        with col4:
+            position = user_info[7] if user_info[7] else ""
+            if position:
+                st.markdown(f"💼 {position}")
+            st.markdown(f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        
+        st.divider()
 
 # ==================== دوال الماسح ==================== #
 def mobile_barcode_scanner(session_key):
@@ -2182,6 +2467,10 @@ if not st.session_state.authenticated:
     
     st.stop()
 
+# ==================== عرض معلومات المكتب في الأعلى ==================== #
+if st.session_state.authenticated and st.session_state.user_info:
+    display_business_header(st.session_state.user_info)
+
 # ==================== الشريط الجانبي ==================== #
 with st.sidebar:
     st.title("🏢 Gestion")
@@ -2219,14 +2508,12 @@ with st.sidebar:
         st.subheader(t("business_info"))
         user = st.session_state.user_info
         
-        # معلومات المكتب
         new_fullname = st.text_input(t("full_name_label"), value=user[3] if user[3] else "", key="edit_fullname")
         new_business_name = st.text_input(t("business_name_label"), value=user[4] if user[4] else "", key="edit_business_name")
         new_business_phone = st.text_input(t("business_phone_label"), value=user[5] if user[5] else "", key="edit_business_phone")
         new_business_email = st.text_input(t("business_email_label"), value=user[6] if user[6] else "", key="edit_business_email")
         new_position = st.text_input(t("position_label"), value=user[7] if user[7] else "", key="edit_position")
         
-        # الشعار
         uploaded_logo = st.file_uploader(t("logo_label"), type=["png", "jpg", "jpeg"], key="logo_upload")
         logo_path = user[8] if user[8] else ""
         
@@ -2240,7 +2527,6 @@ with st.sidebar:
         
         st.divider()
         
-        # ====== إعدادات التخفيضات ======
         st.subheader(t("discount_settings"))
         discount_type = st.selectbox(
             t("discount_type_label"),
@@ -2259,7 +2545,6 @@ with st.sidebar:
         
         st.divider()
         
-        # ====== إعدادات الإشعارات ======
         st.subheader(t("notification_settings"))
         notification_enabled = st.checkbox(
             t("enable_notifications"),
@@ -2298,7 +2583,10 @@ with st.sidebar:
         t("factures"),
         t("commandes"),
         t("services"),
-        t("outils")
+        t("outils"),
+        t("inventory_management"),
+        t("financial_analysis"),
+        t("backup_restore")
     ]
     menu = st.selectbox(t("menu_main"), menu_options)
     
@@ -2391,7 +2679,7 @@ if menu == t("dashboard"):
     elif report_type == "سنوي":
         year_selected = st.selectbox("اختر السنة", range(2020, datetime.now().year + 1))
         df_filtered = df_v[df_v['Date'].str.contains(f"{year_selected}", na=False)]
-    else:  # مخصص
+    else:
         date_start = st.date_input("من", value=datetime.now() - timedelta(days=30))
         date_end = st.date_input("إلى", value=datetime.now())
         df_v['Date_dt'] = pd.to_datetime(df_v['Date'], format='%d/%m/%Y %H:%M', errors='coerce')
@@ -2401,7 +2689,6 @@ if menu == t("dashboard"):
         total_report = df_filtered['Total'].sum() if 'Total' in df_filtered.columns else 0
         st.metric("💰 إجمالي المبيعات", f"{total_report:.2f} DH")
         
-        # رسم بياني للمبيعات
         if 'Date' in df_filtered.columns:
             df_filtered['Date_dt'] = pd.to_datetime(df_filtered['Date'], format='%d/%m/%Y %H:%M', errors='coerce')
             daily_sales_report = df_filtered.groupby(df_filtered['Date_dt'].dt.date)['Total'].sum().reset_index()
@@ -2409,13 +2696,11 @@ if menu == t("dashboard"):
             fig = px.bar(daily_sales_report, x='التاريخ', y='المبيعات', title="المبيعات خلال الفترة")
             st.plotly_chart(fig, use_container_width=True)
         
-        # أفضل المنتجات
         top_products_report = df_filtered.groupby('Nom')['Total'].sum().sort_values(ascending=False).head(10)
         if not top_products_report.empty:
             fig2 = px.pie(values=top_products_report.values, names=top_products_report.index, title="توزيع المبيعات حسب المنتج")
             st.plotly_chart(fig2, use_container_width=True)
         
-        # تصدير التقرير
         st.download_button(
             "📥 تحميل التقرير (Excel)",
             data=to_excel(df_filtered),
@@ -2503,7 +2788,6 @@ if menu == t("pos"):
     user_id = st.session_state.user_id
     user_info = st.session_state.user_info
     
-    # الحصول على إعدادات التخفيض من المستخدم
     user_discount_type = user_info[10] if user_info and len(user_info) > 10 else "percentage"
     user_discount_value = user_info[11] if user_info and len(user_info) > 11 else 0
     
@@ -2515,7 +2799,6 @@ if menu == t("pos"):
         value=st.session_state.auto_sale_mode
     )
     
-    # إضافة خيار التخفيض
     discount_enabled = st.checkbox("💰 تطبيق تخفيض", value=False)
     discount_type = "percentage"
     discount_value = 0
@@ -2564,11 +2847,18 @@ if menu == t("pos"):
                     if facture_result:
                         facture_path, invoice_number = facture_result
                         
+                        final_total = total
+                        if discount_enabled:
+                            if discount_type == "percentage":
+                                final_total = total - (total * (discount_value / 100))
+                            else:
+                                final_total = total - discount_value
+                        
                         save_to_table("ventes", {
                             "Code": code_auto,
                             "Quantité": 1.0,
                             "Prix": float(product['Prix']),
-                            "Total": total - (total * (discount_value/100) if discount_type == "percentage" and discount_enabled else discount_value if discount_enabled else 0),
+                            "Total": final_total,
                             "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
                             "Nom": product.get('Nom', code_auto),
                             "Facture": invoice_number,
@@ -2582,7 +2872,7 @@ if menu == t("pos"):
                         
                         play_success_sound()
                         
-                        st.success(f"✅ {product.get('Nom', code_auto)} - {total:.2f} DH | {t('invoice_number')}: {invoice_number}")
+                        st.success(f"✅ {product.get('Nom', code_auto)} - {final_total:.2f} DH | {t('invoice_number')}: {invoice_number}")
                         st.balloons()
                         
                         time.sleep(1.5)
@@ -2636,6 +2926,13 @@ if menu == t("pos"):
                         if q_old >= qty:
                             total = prix * qty
                             
+                            final_total = total
+                            if discount_enabled:
+                                if discount_type == "percentage":
+                                    final_total = total - (total * (discount_value / 100))
+                                else:
+                                    final_total = total - discount_value
+                            
                             facture_result = generate_facture_80mm(
                                 [{"Nom": nom, "Quantité": qty, "Prix": prix, "Total": total}],
                                 "FACTURE DE VENTE",
@@ -2645,13 +2942,6 @@ if menu == t("pos"):
                             )
                             if facture_result:
                                 facture_path, invoice_number = facture_result
-                                
-                                final_total = total
-                                if discount_enabled:
-                                    if discount_type == "percentage":
-                                        final_total = total - (total * (discount_value / 100))
-                                    else:
-                                        final_total = total - discount_value
                                 
                                 save_to_table("ventes", {
                                     "Code": code, 
@@ -2748,6 +3038,13 @@ if menu == t("pos"):
                         if q_old >= qty_qr:
                             total = prix * qty_qr
                             
+                            final_total = total
+                            if discount_enabled:
+                                if discount_type == "percentage":
+                                    final_total = total - (total * (discount_value / 100))
+                                else:
+                                    final_total = total - discount_value
+                            
                             facture_result = generate_facture_80mm(
                                 [{"Nom": nom, "Quantité": qty_qr, "Prix": prix, "Total": total}],
                                 "FACTURE DE VENTE",
@@ -2757,13 +3054,6 @@ if menu == t("pos"):
                             )
                             if facture_result:
                                 facture_path, invoice_number = facture_result
-                                
-                                final_total = total
-                                if discount_enabled:
-                                    if discount_type == "percentage":
-                                        final_total = total - (total * (discount_value / 100))
-                                    else:
-                                        final_total = total - discount_value
                                 
                                 save_to_table("ventes", {
                                     "Code": code_qr,
@@ -2806,6 +3096,13 @@ if menu == t("pos"):
                 if name and price > 0:
                     total_libre = float(price) * qty_libre
                     
+                    final_total = total_libre
+                    if discount_enabled:
+                        if discount_type == "percentage":
+                            final_total = total_libre - (total_libre * (discount_value / 100))
+                        else:
+                            final_total = total_libre - discount_value
+                    
                     facture_result = generate_facture_80mm(
                         [{"Nom": name, "Quantité": qty_libre, "Prix": float(price), "Total": total_libre}],
                         "FACTURE DE VENTE",
@@ -2815,13 +3112,6 @@ if menu == t("pos"):
                     )
                     if facture_result:
                         facture_path, invoice_number = facture_result
-                        
-                        final_total = total_libre
-                        if discount_enabled:
-                            if discount_type == "percentage":
-                                final_total = total_libre - (total_libre * (discount_value / 100))
-                            else:
-                                final_total = total_libre - discount_value
                         
                         save_to_table("ventes", {
                             "Code": name, 
@@ -2904,6 +3194,13 @@ if menu == t("pos"):
                                         "Quantité": float(product['Quantité']) - item['Quantité']
                                     }, product['id'], user_id)
                             
+                            final_total = total_panier
+                            if discount_enabled:
+                                if discount_type == "percentage":
+                                    final_total = total_panier - (total_panier * (discount_value / 100))
+                                else:
+                                    final_total = total_panier - discount_value
+                            
                             facture_result = generate_facture_80mm(
                                 st.session_state.cart,
                                 "FACTURE DE VENTE",
@@ -2913,13 +3210,6 @@ if menu == t("pos"):
                             )
                             if facture_result:
                                 facture_path, invoice_number = facture_result
-                                
-                                final_total = total_panier
-                                if discount_enabled:
-                                    if discount_type == "percentage":
-                                        final_total = total_panier - (total_panier * (discount_value / 100))
-                                    else:
-                                        final_total = total_panier - discount_value
                                 
                                 for item in st.session_state.cart:
                                     save_to_table("ventes", {
@@ -3021,6 +3311,13 @@ if menu == t("pos"):
                                     "Quantité": float(product['Quantité']) - item['Quantité']
                                 }, product['id'], user_id)
                             
+                        final_total = total_panier
+                        if discount_enabled:
+                            if discount_type == "percentage":
+                                final_total = total_panier - (total_panier * (discount_value / 100))
+                            else:
+                                final_total = total_panier - discount_value
+                        
                         facture_result = generate_facture_80mm(
                             st.session_state.cart,
                             "FACTURE DE VENTE",
@@ -3491,7 +3788,6 @@ elif menu == t("factures"):
     if not df_invoices.empty:
         invoices_display = df_invoices[['Facture', 'Nom', 'Quantité', 'Prix', 'Total', 'Date', 'Discount', 'Discount_Type']].copy()
         invoices_display = invoices_display.drop_duplicates(subset=['Facture'])
-        # إضافة عمود التخفيض
         invoices_display['تخفيض'] = invoices_display.apply(
             lambda x: f"{x['Discount']}{'%' if x['Discount_Type'] == 'percentage' else ' DH'}" if x['Discount'] > 0 else "بدون",
             axis=1
@@ -3978,6 +4274,197 @@ elif menu == t("outils"):
         </iframe>
         """
         components.html(google_iframe, height=650)
+
+# ==================== الجرد الدوري ==================== #
+elif menu == t("inventory_management"):
+    st.header(t("inventory_management"))
+    
+    user_id = st.session_state.user_id
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("📋 إدارة الجرد")
+        
+        if st.button(t("start_inventory"), type="primary", use_container_width=True):
+            if create_inventory_check(user_id):
+                st.success(t("inventory_started"))
+                st.rerun()
+            else:
+                st.error("❌ لا توجد منتجات في المخزون")
+    
+    with col2:
+        st.subheader(t("inventory_report"))
+        
+        df_inventory = get_inventory_report(user_id)
+        if not df_inventory.empty:
+            st.dataframe(df_inventory[['product_name', 'system_quantity', 'physical_quantity', 'difference', 'status', 'date']], use_container_width=True)
+            
+            # تحديث الكميات الفعلية
+            st.subheader("✏️ تحديث الكميات الفعلية")
+            inventory_id = st.selectbox(
+                "اختر المنتج",
+                df_inventory.apply(lambda x: f"{x['product_name']} (النظام: {x['system_quantity']})", axis=1).tolist()
+            )
+            
+            if inventory_id:
+                selected_row = df_inventory[df_inventory.apply(lambda x: f"{x['product_name']} (النظام: {x['system_quantity']})", axis=1) == inventory_id].iloc[0]
+                physical_qty = st.number_input(
+                    "الكمية الفعلية",
+                    min_value=0.0,
+                    value=float(selected_row['system_quantity']),
+                    step=1.0
+                )
+                
+                if st.button("✅ تحديث الكمية"):
+                    if update_inventory_physical(selected_row['id'], physical_qty, user_id):
+                        st.success("✅ تم تحديث الكمية بنجاح")
+                        st.rerun()
+            
+            # عرض ملخص الفروقات
+            st.subheader("📊 ملخص الفروقات")
+            diff_summary = df_inventory.groupby('status')['difference'].agg(['count', 'sum']).reset_index()
+            if not diff_summary.empty:
+                st.dataframe(diff_summary, use_container_width=True)
+                
+                total_diff = df_inventory['difference'].sum()
+                st.metric("إجمالي الفرق", f"{total_diff:.2f}")
+            
+            # تصدير تقرير الجرد
+            st.download_button(
+                "📥 تحميل تقرير الجرد (Excel)",
+                data=to_excel(df_inventory),
+                file_name=f"inventory_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.info("لا يوجد جرد حالياً. ابدأ جرد جديد.")
+
+# ==================== التحليل المالي ==================== #
+elif menu == t("financial_analysis"):
+    st.header(t("financial_analysis"))
+    
+    user_id = st.session_state.user_id
+    
+    # حساب التحليل المالي الحالي
+    analysis = calculate_financial_analysis(user_id)
+    
+    if analysis:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(t("total_sales"), f"{analysis['total_sales']:.2f} DH")
+        with col2:
+            st.metric(t("total_expenses"), f"{analysis['total_expenses']:.2f} DH")
+        with col3:
+            st.metric(t("total_profit"), f"{analysis['total_profit']:.2f} DH")
+        with col4:
+            st.metric(t("profit_margin"), f"{analysis['profit_margin']:.1f}%")
+        
+        st.divider()
+        
+        # حفظ التحليل
+        if st.button("💾 حفظ التحليل المالي"):
+            if save_financial_analysis(user_id):
+                st.success("✅ تم حفظ التحليل المالي")
+                st.rerun()
+    
+    # عرض التحليلات السابقة
+    st.subheader("📊 التحليلات السابقة")
+    df_analysis = get_df("financial_analysis", user_id)
+    if not df_analysis.empty:
+        st.dataframe(df_analysis, use_container_width=True)
+        
+        # رسم بياني للتحليل المالي
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['total_sales'], name='المبيعات', line=dict(color='blue')))
+        fig.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['total_profit'], name='الأرباح', line=dict(color='green')))
+        fig.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['total_expenses'], name='المصروفات', line=dict(color='red')))
+        fig.update_layout(title="تطور المؤشرات المالية", xaxis_title="التاريخ", yaxis_title="المبلغ (DH)")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # تصدير التحليل
+        st.download_button(
+            "📥 تحميل التحليل المالي (Excel)",
+            data=to_excel(df_analysis),
+            file_name=f"financial_analysis_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("لا توجد تحليلات مالية سابقة")
+
+# ==================== النسخ الاحتياطي ==================== #
+elif menu == t("backup_restore"):
+    st.header(t("backup_restore"))
+    
+    user_id = st.session_state.user_id
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader(t("create_backup"))
+        if st.button("📤 " + t("create_backup"), type="primary", use_container_width=True):
+            with st.spinner("جاري إنشاء النسخة الاحتياطية..."):
+                backup_file = create_backup(user_id)
+                if backup_file and os.path.exists(backup_file):
+                    st.success(t("backup_created"))
+                    with open(backup_file, "rb") as f:
+                        st.download_button(
+                            "📥 تحميل النسخة الاحتياطية",
+                            f,
+                            os.path.basename(backup_file),
+                            mime="application/zip"
+                        )
+                else:
+                    st.error("❌ حدث خطأ في إنشاء النسخة الاحتياطية")
+    
+    with col2:
+        st.subheader(t("restore_backup"))
+        uploaded_backup = st.file_uploader(
+            t("restore_backup"),
+            type=["zip"],
+            key="backup_restore"
+        )
+        
+        if uploaded_backup is not None:
+            if st.button("🔄 " + t("restore_backup"), type="primary", use_container_width=True):
+                with st.spinner("جاري استعادة النسخة الاحتياطية..."):
+                    # حفظ الملف المؤقت
+                    temp_file = f"temp_restore_{user_id}.zip"
+                    with open(temp_file, "wb") as f:
+                        f.write(uploaded_backup.getbuffer())
+                    
+                    if restore_backup(temp_file, user_id):
+                        st.success(t("backup_restored"))
+                        os.remove(temp_file)
+                        st.rerun()
+                    else:
+                        st.error("❌ حدث خطأ في استعادة النسخة الاحتياطية")
+    
+    st.divider()
+    
+    # عرض النسخ الاحتياطية السابقة
+    st.subheader("📋 النسخ الاحتياطية السابقة")
+    backups = get_backup_files(user_id)
+    if backups:
+        for backup in backups:
+            col_b1, col_b2, col_b3, col_b4 = st.columns([2, 1, 1, 1])
+            with col_b1:
+                st.write(f"📁 {backup['name']}")
+            with col_b2:
+                st.write(f"📅 {backup['date']}")
+            with col_b3:
+                st.write(f"📊 {backup['size']}")
+            with col_b4:
+                with open(backup['path'], "rb") as f:
+                    st.download_button(
+                        "📥 تحميل",
+                        f,
+                        backup['name'],
+                        mime="application/zip",
+                        key=f"download_{backup['name']}"
+                    )
+    else:
+        st.info("لا توجد نسخ احتياطية سابقة")
 
 # إخفاء footer Streamlit
 hide_streamlit_style = """
