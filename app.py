@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+from supabase import create_client, Client
 import os
 from fpdf import FPDF
 from datetime import datetime, timedelta
@@ -26,308 +26,127 @@ if sys.stdout.encoding != 'utf-8':
 if sys.stderr.encoding != 'utf-8':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# ==================== إعداد SQLite ==================== #
-DB_NAME = "business_management.db"
-BACKUP_DIR = "backups"
+# ==================== إعداد Supabase ==================== #
+try:
+    supabase: Client = create_client(
+        st.secrets["supabase_url"],
+        st.secrets["supabase_key"]
+    )
+except Exception as e:
+    st.error(f"❌ خطأ في الاتصال بـ Supabase: {e}")
+    st.stop()
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def init_database():
-    """إنشاء جميع الجداول في قاعدة البيانات مع مستخدم افتراضي"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # جدول المستخدمين (مع معلومات المكتب والإعدادات)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            full_name TEXT,
-            business_name TEXT,
-            business_phone TEXT,
-            business_email TEXT,
-            position TEXT,
-            logo_path TEXT,
-            notification_enabled INTEGER DEFAULT 1,
-            discount_type TEXT DEFAULT 'percentage',
-            discount_value REAL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # جدول المخزون (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS stock (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Nom TEXT,
-            Prix REAL,
-            Quantité REAL,
-            "Code-barres" TEXT,
-            alert_threshold INTEGER DEFAULT 5,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول المبيعات (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS ventes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Code TEXT,
-            Quantité REAL,
-            Prix REAL,
-            Total REAL,
-            Date TEXT,
-            Nom TEXT,
-            Facture TEXT,
-            Discount REAL DEFAULT 0,
-            Discount_Type TEXT DEFAULT 'percentage',
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول الطباعة (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS impressions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Date TEXT,
-            Prix_Page REAL,
-            Nombre REAL,
-            Total REAL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول الديون (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS credits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Client TEXT,
-            Montant REAL,
-            Date TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول الطلبيات (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS commandes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Nom TEXT,
-            Qté REAL,
-            Prix_U REAL,
-            Total REAL,
-            Date TEXT,
-            Statut TEXT DEFAULT 'En attente',
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول تاريخ الخزينة (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS historique_caisse (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Date TEXT,
-            Total_Ventes REAL,
-            Total_Impressions REAL,
-            Total_Jour REAL,
-            Heure_Fermeture TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول مدفوعات الديون (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS paiements_credits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Credit_ID INTEGER,
-            Client TEXT,
-            Montant_Paye REAL,
-            Reste REAL,
-            Date TEXT,
-            Type TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول الخدمات الإلكترونية (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS services_electroniques (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            Nom TEXT,
-            Prix REAL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول الإشعارات (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message TEXT,
-            type TEXT,
-            read INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول الجرد الدوري (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            product_id INTEGER,
-            product_name TEXT,
-            system_quantity REAL,
-            physical_quantity REAL,
-            difference REAL,
-            date TEXT,
-            status TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # جدول التحليل المالي (مرتبط بالمستخدم)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS financial_analysis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            date TEXT,
-            total_sales REAL,
-            total_expenses REAL,
-            total_profit REAL,
-            profit_margin REAL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # ====== إضافة مستخدم افتراضي "version" ======
-    cursor.execute('SELECT * FROM users WHERE username = ?', ('version',))
-    user_exists = cursor.fetchone()
-    
-    if not user_exists:
-        hashed_password = hash_password("123456789")
-        cursor.execute('''
-            INSERT INTO users (username, password, full_name, business_name, business_phone, business_email, position, notification_enabled, discount_type, discount_value, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', ('version', hashed_password, 'مدير النظام', 'مكتبي', '0612345678', 'admin@example.com', 'مدير', 1, 'percentage', 0))
-        print("✅ تم إنشاء المستخدم version")
-    
-    conn.commit()
-    conn.close()
-
-# تهيئة قاعدة البيانات
-init_database()
-
-# ==================== دوال قاعدة البيانات ==================== #
-def get_connection():
-    return sqlite3.connect(DB_NAME)
+# ==================== دوال قاعدة البيانات (Supabase) ==================== #
 
 def check_user(username, password):
     """التحقق من المستخدم"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    hashed = hash_password(password)
-    cursor.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, hashed))
-    user = cursor.fetchone()
-    conn.close()
-    return user
+    try:
+        hashed = hash_password(password)
+        response = supabase.table("users").select("*").eq("username", username).eq("password", hashed).execute()
+        if response.data:
+            return response.data[0]
+        return None
+    except Exception as e:
+        return None
 
 def create_user(username, password, full_name="", business_name="", business_phone="", business_email="", position="", logo_path=""):
     """إنشاء مستخدم جديد"""
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
         hashed = hash_password(password)
-        cursor.execute('''
-            INSERT INTO users (username, password, full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (username, hashed, full_name, business_name, business_phone, business_email, position, logo_path, 1, 'percentage', 0))
-        conn.commit()
-        conn.close()
+        supabase.table("users").insert({
+            "username": username,
+            "password": hashed,
+            "full_name": full_name,
+            "business_name": business_name,
+            "business_phone": business_phone,
+            "business_email": business_email,
+            "position": position,
+            "logo_path": logo_path,
+            "notification_enabled": 1,
+            "discount_type": "percentage",
+            "discount_value": 0,
+            "printer_type": "thermal",
+            "scanner_type": "camera"
+        }).execute()
         return True
-    except sqlite3.IntegrityError:
+    except Exception as e:
         return False
 
-def update_user_info(user_id, full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users 
-        SET full_name = ?, business_name = ?, business_phone = ?, business_email = ?, position = ?, logo_path = ?, notification_enabled = ?, discount_type = ?, discount_value = ?
-        WHERE id = ?
-    ''', (full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value, user_id))
-    conn.commit()
-    conn.close()
+def update_user_info(user_id, full_name, business_name, business_phone, business_email, position, logo_path, notification_enabled, discount_type, discount_value, printer_type, scanner_type):
+    """تحديث معلومات المستخدم"""
+    try:
+        supabase.table("users").update({
+            "full_name": full_name,
+            "business_name": business_name,
+            "business_phone": business_phone,
+            "business_email": business_email,
+            "position": position,
+            "logo_path": logo_path,
+            "notification_enabled": notification_enabled,
+            "discount_type": discount_type,
+            "discount_value": discount_value,
+            "printer_type": printer_type,
+            "scanner_type": scanner_type
+        }).eq("id", user_id).execute()
+        return True
+    except Exception as e:
+        return False
 
 def get_user_info(user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
+    """الحصول على معلومات المستخدم"""
+    try:
+        response = supabase.table("users").select("*").eq("id", user_id).execute()
+        if response.data:
+            return response.data[0]
+        return None
+    except Exception as e:
+        return None
 
 def get_df(table_name, user_id=None):
-    conn = get_connection()
+    """جلب البيانات من جدول كـ DataFrame"""
     try:
+        query = supabase.table(table_name).select("*")
         if user_id:
-            query = f'SELECT * FROM {table_name} WHERE user_id = ?'
-            df = pd.read_sql_query(query, conn, params=(user_id,))
-        else:
-            df = pd.read_sql_query(f'SELECT * FROM {table_name}', conn)
-        conn.close()
-        return df
+            query = query.eq("user_id", user_id)
+        response = query.execute()
+        if response.data:
+            return pd.DataFrame(response.data)
+        return pd.DataFrame()
     except Exception as e:
-        conn.close()
         return pd.DataFrame()
 
 def save_to_table(table_name, data_dict, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    data_dict['user_id'] = user_id
-    columns = ', '.join(data_dict.keys())
-    placeholders = ', '.join(['?' for _ in data_dict])
-    values = list(data_dict.values())
-    
-    query = f'INSERT INTO {table_name} ({columns}) VALUES ({placeholders})'
-    cursor.execute(query, values)
-    conn.commit()
-    conn.close()
-    return cursor.lastrowid
+    """حفظ البيانات في جدول"""
+    try:
+        data_dict['user_id'] = user_id
+        response = supabase.table(table_name).insert(data_dict).execute()
+        if response.data:
+            return response.data[0]['id']
+        return None
+    except Exception as e:
+        return None
 
 def update_table(table_name, data_dict, id_value, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    set_clause = ', '.join([f'{key} = ?' for key in data_dict.keys()])
-    values = list(data_dict.values()) + [id_value, user_id]
-    
-    query = f'UPDATE {table_name} SET {set_clause} WHERE id = ? AND user_id = ?'
-    cursor.execute(query, values)
-    conn.commit()
-    conn.close()
+    """تحديث البيانات في جدول"""
+    try:
+        supabase.table(table_name).update(data_dict).eq("id", id_value).eq("user_id", user_id).execute()
+        return True
+    except Exception as e:
+        return False
 
 def delete_from_table(table_name, id_value, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(f'DELETE FROM {table_name} WHERE id = ? AND user_id = ?', (id_value, user_id))
-    conn.commit()
-    conn.close()
+    """حذف بيانات من جدول"""
+    try:
+        supabase.table(table_name).delete().eq("id", id_value).eq("user_id", user_id).execute()
+        return True
+    except Exception as e:
+        return False
 
 def get_all_invoices(user_id):
+    """جلب جميع الفواتير"""
     df_ventes = get_df("ventes", user_id)
     if df_ventes.empty:
         return pd.DataFrame()
@@ -335,6 +154,7 @@ def get_all_invoices(user_id):
     return df_invoices
 
 def get_next_invoice_number(user_id):
+    """الحصول على رقم الفاتورة التالي"""
     df_ventes = get_df("ventes", user_id)
     if df_ventes.empty:
         return "FACT-0001"
@@ -363,23 +183,28 @@ def clean_text_for_pdf(text):
     return text.strip()
 
 def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None, discount=0, discount_type="percentage"):
-    """إنشاء فاتورة PDF مع دعم التخفيضات"""
+    """إنشاء فاتورة PDF حسب نوع الطابعة"""
     try:
-        invoice_number = get_next_invoice_number(user_info[0] if user_info else None)
+        invoice_number = get_next_invoice_number(user_info['id'] if user_info else None)
         
-        pdf = FPDF('P', 'mm', (80, 297))
+        printer_type = user_info.get('printer_type', 'thermal') if user_info else "thermal"
+        
+        if printer_type == "thermal":
+            pdf = FPDF('P', 'mm', (80, 297))
+        else:
+            pdf = FPDF('P', 'mm', 'A4')
+        
         pdf.add_page()
         pdf.set_auto_page_break(auto=True, margin=5)
-        
         pdf.set_font("Helvetica", 'B', 14)
         
-        if user_info and user_info[8] and os.path.exists(user_info[8]):
+        if user_info and user_info.get('logo_path') and os.path.exists(user_info['logo_path']):
             try:
-                pdf.image(user_info[8], x=5, y=5, w=20)
+                pdf.image(user_info['logo_path'], x=5, y=5, w=20)
             except:
                 pass
         
-        business_name = user_info[4] if user_info and user_info[4] else "Business"
+        business_name = user_info.get('business_name', 'Business') if user_info else "Business"
         business_name_clean = clean_text_for_pdf(business_name)
         pdf.cell(70, 8, business_name_clean, ln=True, align='C')
         
@@ -391,14 +216,14 @@ def generate_facture_80mm(cart_data, titre="FACTURE", user_info=None, discount=0
         pdf.cell(70, 4, f"Facture N°: {invoice_number}", ln=True, align='C')
         
         if user_info:
-            if user_info[5]:
-                pdf.cell(70, 4, f"Tel: {user_info[5]}", ln=True, align='C')
-            if user_info[6]:
-                pdf.cell(70, 4, clean_text_for_pdf(user_info[6]), ln=True, align='C')
-            if user_info[3]:
-                pdf.cell(70, 4, f"Responsable: {clean_text_for_pdf(user_info[3])}", ln=True, align='C')
-            if user_info[7]:
-                pdf.cell(70, 4, f"Poste: {clean_text_for_pdf(user_info[7])}", ln=True, align='C')
+            if user_info.get('business_phone'):
+                pdf.cell(70, 4, f"Tel: {user_info['business_phone']}", ln=True, align='C')
+            if user_info.get('business_email'):
+                pdf.cell(70, 4, clean_text_for_pdf(user_info['business_email']), ln=True, align='C')
+            if user_info.get('full_name'):
+                pdf.cell(70, 4, f"Responsable: {clean_text_for_pdf(user_info['full_name'])}", ln=True, align='C')
+            if user_info.get('position'):
+                pdf.cell(70, 4, f"Poste: {clean_text_for_pdf(user_info['position'])}", ln=True, align='C')
         
         pdf.cell(70, 4, "-" * 40, ln=True, align='C')
         
@@ -504,22 +329,19 @@ def reprint_invoice(invoice_number, user_id):
     return None, None
 
 def get_product_info(code_or_name, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM stock WHERE "Code-barres" = ? AND user_id = ?', (code_or_name, user_id))
-    product = cursor.fetchone()
-    
-    if not product:
-        cursor.execute('SELECT * FROM stock WHERE Nom = ? AND user_id = ?', (code_or_name, user_id))
-        product = cursor.fetchone()
-    
-    conn.close()
-    
-    if product:
-        columns = ['id', 'user_id', 'Nom', 'Prix', 'Quantité', 'Code-barres', 'alert_threshold']
-        return dict(zip(columns, product))
-    return None
+    """الحصول على معلومات المنتج"""
+    try:
+        response = supabase.table("stock").select("*").eq("Code-barres", code_or_name).eq("user_id", user_id).execute()
+        if response.data:
+            return response.data[0]
+        
+        response = supabase.table("stock").select("*").eq("Nom", code_or_name).eq("user_id", user_id).execute()
+        if response.data:
+            return response.data[0]
+        
+        return None
+    except Exception as e:
+        return None
 
 def check_stock_levels(user_id):
     df = get_df("stock", user_id)
@@ -528,7 +350,6 @@ def check_stock_levels(user_id):
     return pd.DataFrame()
 
 def check_and_create_notifications(user_id):
-    """التحقق من المخزون وإنشاء إشعارات إذا لزم الأمر"""
     df_stock = get_df("stock", user_id)
     notifications = []
     
@@ -556,23 +377,18 @@ def mark_notification_read(notification_id, user_id):
     update_table("notifications", {"read": 1}, notification_id, user_id)
 
 def confirm_purchase(cmd_id, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
     try:
-        cursor.execute('SELECT * FROM commandes WHERE id = ? AND user_id = ?', (int(cmd_id), user_id))
-        item = cursor.fetchone()
+        response = supabase.table("commandes").select("*").eq("id", cmd_id).eq("user_id", user_id).execute()
+        item = response.data[0]
         
-        cursor.execute('SELECT * FROM stock WHERE Nom = ? AND user_id = ?', (item[2], user_id))
-        stk = cursor.fetchone()
+        response2 = supabase.table("stock").select("*").eq("Nom", item['Nom']).eq("user_id", user_id).execute()
+        stk = response2.data[0]
         
-        new_q = stk[4] + item[3]
-        cursor.execute('UPDATE stock SET Quantité = ? WHERE id = ? AND user_id = ?', (new_q, stk[0], user_id))
-        cursor.execute('UPDATE commandes SET Statut = "Recu" WHERE id = ? AND user_id = ?', (int(cmd_id), user_id))
-        conn.commit()
-        conn.close()
+        new_q = stk['Quantité'] + item['Qté']
+        supabase.table("stock").update({"Quantité": new_q}).eq("id", stk['id']).eq("user_id", user_id).execute()
+        supabase.table("commandes").update({"Statut": "Recu"}).eq("id", cmd_id).eq("user_id", user_id).execute()
         return True
     except Exception as e:
-        conn.close()
         return False
 
 def reset_caisse(user_id):
@@ -584,158 +400,86 @@ def reset_caisse(user_id):
     total_impressions = df_impressions['Total'].sum() if not df_impressions.empty and 'Total' in df_impressions.columns else 0
     total_jour = total_ventes + total_impressions
     
-    conn = get_connection()
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute('''
-            INSERT INTO historique_caisse (user_id, Date, Total_Ventes, Total_Impressions, Total_Jour, Heure_Fermeture)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, date_aujourdhui, float(total_ventes), float(total_impressions), float(total_jour), datetime.now().strftime('%H:%M:%S')))
-        conn.commit()
+        supabase.table("historique_caisse").insert({
+            "user_id": user_id,
+            "Date": date_aujourdhui,
+            "Total_Ventes": float(total_ventes),
+            "Total_Impressions": float(total_impressions),
+            "Total_Jour": float(total_jour),
+            "Heure_Fermeture": datetime.now().strftime('%H:%M:%S')
+        }).execute()
     except:
         pass
     
     try:
-        cursor.execute('DELETE FROM ventes WHERE user_id = ? AND Date LIKE ?', (user_id, f"{date_aujourdhui}%"))
+        supabase.table("ventes").delete().like("Date", f"{date_aujourdhui}%").eq("user_id", user_id).execute()
     except:
         pass
     try:
-        cursor.execute('DELETE FROM impressions WHERE user_id = ? AND Date LIKE ?', (user_id, f"{date_aujourdhui}%"))
+        supabase.table("impressions").delete().like("Date", f"{date_aujourdhui}%").eq("user_id", user_id).execute()
     except:
         pass
     try:
-        cursor.execute('DELETE FROM credits WHERE user_id = ? AND Date LIKE ?', (user_id, f"{date_aujourdhui}%"))
+        supabase.table("credits").delete().like("Date", f"{date_aujourdhui}%").eq("user_id", user_id).execute()
     except:
         pass
     try:
-        cursor.execute('DELETE FROM paiements_credits WHERE user_id = ? AND Date LIKE ?', (user_id, f"{date_aujourdhui}%"))
+        supabase.table("paiements_credits").delete().like("Date", f"{date_aujourdhui}%").eq("user_id", user_id).execute()
     except:
         pass
     
-    conn.commit()
-    conn.close()
     return total_jour
 
 def reduce_credit(credit_id, montant_reduction, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM credits WHERE id = ? AND user_id = ?', (int(credit_id), user_id))
-    credit_actuel = cursor.fetchone()
-    
-    nouveau_montant = float(credit_actuel[3]) - float(montant_reduction)
-    if nouveau_montant < 0:
-        nouveau_montant = 0
-    
-    cursor.execute('UPDATE credits SET Montant = ? WHERE id = ? AND user_id = ?', (nouveau_montant, int(credit_id), user_id))
-    
-    cursor.execute('''
-        INSERT INTO paiements_credits (user_id, Credit_ID, Client, Montant_Paye, Reste, Date, Type)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, int(credit_id), credit_actuel[2], float(montant_reduction), nouveau_montant, 
-          datetime.now().strftime('%d/%m/%Y %H:%M'), "Paiement"))
-    
-    conn.commit()
-    conn.close()
-    return nouveau_montant
-
-def add_to_credit(credit_id, montant_addition, user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM credits WHERE id = ? AND user_id = ?', (int(credit_id), user_id))
-    credit_actuel = cursor.fetchone()
-    
-    nouveau_montant = float(credit_actuel[3]) + float(montant_addition)
-    
-    cursor.execute('UPDATE credits SET Montant = ? WHERE id = ? AND user_id = ?', (nouveau_montant, int(credit_id), user_id))
-    
-    cursor.execute('''
-        INSERT INTO paiements_credits (user_id, Credit_ID, Client, Montant_Paye, Reste, Date, Type)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, int(credit_id), credit_actuel[2], float(montant_addition), nouveau_montant,
-          datetime.now().strftime('%d/%m/%Y %H:%M'), "Addition"))
-    
-    conn.commit()
-    conn.close()
-    return nouveau_montant
-
-def play_success_sound():
-    sound_html = """
-    <audio autoplay>
-        <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=">
-    </audio>
-    """
-    components.html(sound_html, height=0)
-
-# ==================== دوال التخزين السحابي ==================== #
-def create_backup(user_id):
-    """إنشاء نسخة احتياطية من قاعدة البيانات"""
-    if not os.path.exists(BACKUP_DIR):
-        os.makedirs(BACKUP_DIR)
-    
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    backup_file = os.path.join(BACKUP_DIR, f"backup_{user_id}_{timestamp}.db")
-    
     try:
-        shutil.copy2(DB_NAME, backup_file)
-        # إنشاء ملف ZIP للنسخ الاحتياطي
-        zip_file = f"{backup_file}.zip"
-        with zipfile.ZipFile(zip_file, 'w') as zipf:
-            zipf.write(backup_file, os.path.basename(backup_file))
-        os.remove(backup_file)
-        return zip_file
+        response = supabase.table("credits").select("*").eq("id", credit_id).eq("user_id", user_id).execute()
+        credit_actuel = response.data[0]
+        
+        nouveau_montant = float(credit_actuel['Montant']) - float(montant_reduction)
+        if nouveau_montant < 0:
+            nouveau_montant = 0
+        
+        supabase.table("credits").update({"Montant": nouveau_montant}).eq("id", credit_id).eq("user_id", user_id).execute()
+        
+        supabase.table("paiements_credits").insert({
+            "user_id": user_id,
+            "Credit_ID": credit_id,
+            "Client": credit_actuel['Client'],
+            "Montant_Paye": float(montant_reduction),
+            "Reste": nouveau_montant,
+            "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
+            "Type": "Paiement"
+        }).execute()
+        
+        return nouveau_montant
     except Exception as e:
-        st.error(f"❌ خطأ في إنشاء النسخ الاحتياطي: {str(e)}")
         return None
 
-def restore_backup(zip_file, user_id):
-    """استعادة نسخة احتياطية"""
+def add_to_credit(credit_id, montant_addition, user_id):
     try:
-        # استخراج الملف من ZIP
-        with zipfile.ZipFile(zip_file, 'r') as zipf:
-            zipf.extractall("temp_restore")
+        response = supabase.table("credits").select("*").eq("id", credit_id).eq("user_id", user_id).execute()
+        credit_actuel = response.data[0]
         
-        # العثور على ملف قاعدة البيانات المستخرج
-        extracted_files = os.listdir("temp_restore")
-        db_file = None
-        for f in extracted_files:
-            if f.endswith('.db'):
-                db_file = os.path.join("temp_restore", f)
-                break
+        nouveau_montant = float(credit_actuel['Montant']) + float(montant_addition)
         
-        if db_file:
-            # استعادة قاعدة البيانات
-            shutil.copy2(db_file, DB_NAME)
-            # تنظيف الملفات المؤقتة
-            shutil.rmtree("temp_restore")
-            return True
-        return False
+        supabase.table("credits").update({"Montant": nouveau_montant}).eq("id", credit_id).eq("user_id", user_id).execute()
+        
+        supabase.table("paiements_credits").insert({
+            "user_id": user_id,
+            "Credit_ID": credit_id,
+            "Client": credit_actuel['Client'],
+            "Montant_Paye": float(montant_addition),
+            "Reste": nouveau_montant,
+            "Date": datetime.now().strftime('%d/%m/%Y %H:%M'),
+            "Type": "Addition"
+        }).execute()
+        
+        return nouveau_montant
     except Exception as e:
-        st.error(f"❌ خطأ في استعادة النسخ الاحتياطي: {str(e)}")
-        return False
+        return None
 
-def get_backup_files(user_id):
-    """الحصول على قائمة ملفات النسخ الاحتياطي"""
-    backups = []
-    if os.path.exists(BACKUP_DIR):
-        for f in os.listdir(BACKUP_DIR):
-            if f.startswith(f"backup_{user_id}") and f.endswith('.zip'):
-                file_path = os.path.join(BACKUP_DIR, f)
-                file_size = os.path.getsize(file_path) / 1024  # KB
-                file_date = datetime.fromtimestamp(os.path.getmtime(file_path)).strftime('%d/%m/%Y %H:%M')
-                backups.append({
-                    'name': f,
-                    'path': file_path,
-                    'size': f"{file_size:.1f} KB",
-                    'date': file_date
-                })
-    return sorted(backups, key=lambda x: x['date'], reverse=True)
-
-# ==================== دوال الجرد الدوري ==================== #
 def create_inventory_check(user_id):
-    """إنشاء جرد دوري جديد"""
     df_stock = get_df("stock", user_id)
     if not df_stock.empty:
         today = datetime.now().strftime('%d/%m/%Y %H:%M')
@@ -744,7 +488,7 @@ def create_inventory_check(user_id):
                 "product_id": row['id'],
                 "product_name": row['Nom'],
                 "system_quantity": row['Quantité'],
-                "physical_quantity": row['Quantité'],  # سيتم تحديثها يدوياً
+                "physical_quantity": row['Quantité'],
                 "difference": 0,
                 "date": today,
                 "status": "pending"
@@ -753,52 +497,36 @@ def create_inventory_check(user_id):
     return False
 
 def update_inventory_physical(inventory_id, physical_qty, user_id):
-    """تحديث الكمية الفعلية في الجرد"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM inventory WHERE id = ? AND user_id = ?', (inventory_id, user_id))
-    item = cursor.fetchone()
-    if item:
-        diff = physical_qty - item[4]  # system_quantity
-        cursor.execute('''
-            UPDATE inventory 
-            SET physical_quantity = ?, difference = ?, status = 'completed'
-            WHERE id = ? AND user_id = ?
-        ''', (physical_qty, diff, inventory_id, user_id))
-        conn.commit()
-        conn.close()
+    try:
+        response = supabase.table("inventory").select("*").eq("id", inventory_id).eq("user_id", user_id).execute()
+        item = response.data[0]
+        diff = physical_qty - item['system_quantity']
+        supabase.table("inventory").update({
+            "physical_quantity": physical_qty,
+            "difference": diff,
+            "status": "completed"
+        }).eq("id", inventory_id).eq("user_id", user_id).execute()
         return True
-    conn.close()
-    return False
+    except Exception as e:
+        return False
 
 def get_inventory_report(user_id):
-    """الحصول على تقرير الجرد"""
     df = get_df("inventory", user_id)
     if not df.empty:
-        # حساب الفروقات
         df['difference'] = df['physical_quantity'] - df['system_quantity']
         return df
     return pd.DataFrame()
 
-# ==================== دوال التحليل المالي ==================== #
-def calculate_financial_analysis(user_id, period="month"):
-    """حساب التحليل المالي"""
+def calculate_financial_analysis(user_id):
     df_ventes = get_df("ventes", user_id)
     df_impressions = get_df("impressions", user_id)
     
     if df_ventes.empty:
         return None
     
-    # حساب إجمالي المبيعات
     total_sales = df_ventes['Total'].sum() if 'Total' in df_ventes.columns else 0
-    
-    # حساب إجمالي المصروفات (الطباعة والخدمات)
     total_expenses = df_impressions['Total'].sum() if not df_impressions.empty and 'Total' in df_impressions.columns else 0
-    
-    # حساب الأرباح
     total_profit = total_sales - total_expenses
-    
-    # حساب هامش الربح
     profit_margin = (total_profit / total_sales * 100) if total_sales > 0 else 0
     
     return {
@@ -809,7 +537,6 @@ def calculate_financial_analysis(user_id, period="month"):
     }
 
 def save_financial_analysis(user_id):
-    """حفظ التحليل المالي في قاعدة البيانات"""
     analysis = calculate_financial_analysis(user_id)
     if analysis:
         save_to_table("financial_analysis", {
@@ -821,6 +548,432 @@ def save_financial_analysis(user_id):
         }, user_id)
         return True
     return False
+
+def play_success_sound():
+    sound_html = """
+    <audio autoplay>
+        <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=">
+    </audio>
+    """
+    components.html(sound_html, height=0)
+
+# ==================== دوال الماسح ==================== #
+def mobile_barcode_scanner(session_key):
+    scanner_html = f"""
+    <div id="barcode-scanner-container" style="width:100%; min-height:350px; border:2px dashed #4CAF50; border-radius:10px; padding:15px; background:#f9f9f9;">
+        <div id="reader" style="width:100%; min-height:300px;"></div>
+        <p style="text-align:center; color:#666; font-size:14px; margin-top:10px;">📱 قرب الباركود من الكاميرا</p>
+        <div id="scan-status" style="text-align:center; font-size:14px; color:#999; margin-top:5px;">⏳ جاري تهيئة الكاميرا...</div>
+    </div>
+    
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script>
+    (function() {{
+        'use strict';
+        
+        let html5Qrcode = null;
+        let isScanning = false;
+        let scannerStarted = false;
+        let lastScanned = '';
+        let retryCount = 0;
+        const maxRetries = 3;
+        
+        function updateStatus(message, isSuccess = false, isError = false) {{
+            const statusEl = document.getElementById('scan-status');
+            if (statusEl) {{
+                statusEl.textContent = message;
+                statusEl.style.color = isError ? '#f44336' : (isSuccess ? '#4CAF50' : '#666');
+            }}
+        }}
+        
+        function setInputValue(value) {{
+            let input = document.getElementById('{session_key}');
+            if (!input) {{
+                const inputs = document.getElementsByName('{session_key}');
+                if (inputs.length > 0) input = inputs[0];
+            }}
+            if (!input) {{
+                const inputs = document.querySelectorAll('input[aria-label="{session_key}"]');
+                if (inputs.length > 0) input = inputs[0];
+            }}
+            if (!input) {{
+                const allInputs = document.querySelectorAll('input');
+                for (let el of allInputs) {{
+                    if (el.placeholder && (el.placeholder.includes('باركود') || el.placeholder.includes('barcode') || el.placeholder.includes('Code'))) {{
+                        input = el;
+                        break;
+                    }}
+                }}
+            }}
+            if (input) {{
+                input.value = value;
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                input.style.background = '#a5d6a7';
+                input.style.border = '3px solid #4CAF50';
+                input.style.transition = 'all 0.3s';
+                setTimeout(() => {{
+                    input.style.background = '';
+                    input.style.border = '';
+                }}, 1500);
+                return true;
+            }}
+            return false;
+        }}
+        
+        function sendToStreamlit(value) {{
+            window.parent.postMessage({{
+                type: 'streamlit:setComponentValue',
+                key: '{session_key}',
+                value: value
+            }}, '*');
+            setTimeout(() => {{
+                window.parent.postMessage({{
+                    type: 'streamlit:setComponentValue',
+                    key: '{session_key}',
+                    value: value
+                }}, '*');
+            }}, 50);
+            setTimeout(() => {{
+                window.parent.postMessage({{
+                    type: 'streamlit:setComponentValue',
+                    key: '{session_key}',
+                    value: value
+                }}, '*');
+            }}, 200);
+        }}
+        
+        function handleSuccessfulScan(decodedText) {{
+            if (decodedText === lastScanned) return;
+            lastScanned = decodedText;
+            updateStatus('✅ تم المسح: ' + decodedText, true);
+            setInputValue(decodedText);
+            sendToStreamlit(decodedText);
+            if (html5Qrcode) {{
+                html5Qrcode.stop().then(() => {{
+                    isScanning = false;
+                    scannerStarted = false;
+                    updateStatus('📸 جاهز للمسح مرة أخرى', false);
+                    setTimeout(() => {{
+                        lastScanned = '';
+                        startScanner();
+                    }}, 2000);
+                }}).catch(function(err) {{
+                    console.warn('Stop error:', err);
+                    isScanning = false;
+                    scannerStarted = false;
+                    setTimeout(() => {{
+                        lastScanned = '';
+                        startScanner();
+                    }}, 2000);
+                }});
+            }}
+            window.parent.postMessage({{
+                type: 'streamlit:setComponentValue',
+                key: '{session_key}',
+                value: decodedText
+            }}, '*');
+        }}
+        
+        function startScanner() {{
+            if (isScanning || scannerStarted) return;
+            const container = document.getElementById('barcode-scanner-container');
+            if (!container) return;
+            try {{
+                if (html5Qrcode) {{
+                    html5Qrcode.clear();
+                    html5Qrcode = null;
+                }}
+                const readerElement = document.getElementById('reader');
+                if (!readerElement) return;
+                html5Qrcode = new Html5Qrcode("reader");
+                scannerStarted = true;
+                const config = {{
+                    fps: 15,
+                    qrbox: {{width: 280, height: 280}},
+                    aspectRatio: 1.0,
+                    facingMode: "environment"
+                }};
+                updateStatus('📷 جاري تشغيل الكاميرا...', false);
+                html5Qrcode.start(
+                    {{ facingMode: "environment" }},
+                    config,
+                    function(decodedText, decodedResult) {{
+                        if (decodedText) {{
+                            handleSuccessfulScan(decodedText);
+                        }}
+                    }},
+                    function(errorMessage) {{}}
+                ).then(function() {{
+                    isScanning = true;
+                    updateStatus('📷 الكاميرا شغالة - امسح الباركود', false);
+                }}).catch(function(err) {{
+                    console.error('Scanner start error:', err);
+                    updateStatus('❌ خطأ: ' + err.message, false, true);
+                    scannerStarted = false;
+                    retryCount++;
+                    if (retryCount < maxRetries) {{
+                        setTimeout(startScanner, 2000);
+                    }} else {{
+                        updateStatus('❌ تعذر تشغيل الكاميرا بعد ' + maxRetries + ' محاولات', false, true);
+                    }}
+                }});
+            }} catch(e) {{
+                console.error('Scanner error:', e);
+                updateStatus('❌ خطأ: ' + e.message, false, true);
+                scannerStarted = false;
+                retryCount++;
+                if (retryCount < maxRetries) {{
+                    setTimeout(startScanner, 2000);
+                }}
+            }}
+        }}
+        setTimeout(startScanner, 1000);
+        document.addEventListener('visibilitychange', function() {{
+            if (!document.hidden && !isScanning && !scannerStarted) {{
+                retryCount = 0;
+                setTimeout(startScanner, 500);
+            }}
+        }});
+    }})();
+    </script>
+    """
+    components.html(scanner_html, height=420)
+
+def fast_barcode_scanner_with_qty(input_label, qty_label):
+    scanner_html = f"""
+    <div id="reader" style="width:100%"></div>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script>
+    function onScanSuccess(decodedText, decodedResult) {{
+        const inputs = window.parent.document.querySelectorAll('input');
+        let codeInput = null;
+        let qtyInput = null;
+        inputs.forEach(input => {{
+            if (input.getAttribute('aria-label') === '{input_label}') {{
+                codeInput = input;
+            }}
+            if (input.getAttribute('aria-label') === '{qty_label}') {{
+                qtyInput = input;
+            }}
+        }});
+        if (codeInput) {{
+            codeInput.value = decodedText;
+            codeInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            codeInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+        if (qtyInput && !qtyInput.value) {{
+            qtyInput.value = '1';
+            qtyInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            qtyInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+    }}
+    let html5QrcodeScanner = new Html5QrcodeScanner("reader", {{ fps: 10, qrbox: 250, facingMode: "environment" }});
+    html5QrcodeScanner.render(onScanSuccess);
+    </script>
+    """
+    components.html(scanner_html, height=400)
+
+def auto_sale_scanner():
+    scanner_html = """
+    <div id="reader" style="width:100%"></div>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script>
+    let lastScan = '';
+    let scanTimeout;
+    function onScanSuccess(decodedText, decodedResult) {
+        if (decodedText !== lastScan) {
+            lastScan = decodedText;
+            clearTimeout(scanTimeout);
+            scanTimeout = setTimeout(() => { lastScan = ''; }, 2000);
+            const inputs = window.parent.document.querySelectorAll('input');
+            inputs.forEach(input => {
+                if (input.getAttribute('aria-label') === 'Auto-Scan') {
+                    input.value = decodedText;
+                    input.dispatchEvent(new Event('input', {bubbles: true}));
+                    input.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            });
+        }
+    }
+    let html5QrcodeScanner = new Html5QrcodeScanner("reader", {fps: 10, qrbox: 250, facingMode: "environment"});
+    html5QrcodeScanner.render(onScanSuccess);
+    </script>
+    """
+    components.html(scanner_html, height=350)
+
+def auto_cart_scanner():
+    scanner_html = """
+    <div id="auto_cart_reader" style="width:100%"></div>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script>
+    let lastCartScan = '';
+    let cartScanTimeout;
+    function onScanSuccess(decodedText, decodedResult) {
+        if (decodedText !== lastCartScan) {
+            lastCartScan = decodedText;
+            clearTimeout(cartScanTimeout);
+            cartScanTimeout = setTimeout(() => { lastCartScan = ''; }, 1500);
+            const inputs = window.parent.document.querySelectorAll('input');
+            inputs.forEach(input => {
+                if (input.getAttribute('aria-label') === 'Auto-Cart-Scan') {
+                    input.value = decodedText;
+                    input.dispatchEvent(new Event('input', {bubbles: true}));
+                    input.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            });
+        }
+    }
+    let html5QrcodeScanner = new Html5QrcodeScanner("auto_cart_reader", {fps: 10, qrbox: 250, facingMode: "environment"});
+    html5QrcodeScanner.render(onScanSuccess);
+    </script>
+    """
+    components.html(scanner_html, height=300)
+
+def stock_barcode_scanner(target_input_label):
+    scanner_html = f"""
+    <div id="stock_reader" style="width:100%"></div>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script>
+    let lastStockScan = '';
+    let stockScanTimeout;
+    
+    function onScanSuccess(decodedText, decodedResult) {{
+        if (decodedText !== lastStockScan) {{
+            lastStockScan = decodedText;
+            clearTimeout(stockScanTimeout);
+            stockScanTimeout = setTimeout(() => {{ lastStockScan = ''; }}, 2000);
+            
+            const inputs = window.parent.document.querySelectorAll('input');
+            inputs.forEach(function(input) {{
+                if (input.getAttribute('aria-label') === '{target_input_label}') {{
+                    input.value = decodedText;
+                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    input.style.background = '#e8f5e9';
+                    setTimeout(() => {{ input.style.background = ''; }}, 500);
+                }}
+            }});
+        }}
+    }}
+    
+    let html5QrcodeScanner = new Html5QrcodeScanner(
+        "stock_reader", 
+        {{fps: 10, qrbox: 250, facingMode: "environment"}}
+    );
+    html5QrcodeScanner.render(onScanSuccess);
+    </script>
+    """
+    components.html(scanner_html, height=300)
+
+# ==================== نظام التحكم الصوتي ==================== #
+def voice_command_component():
+    voice_html = """
+    <div id="voice-control">
+        <button id="start-voice" style="padding:10px 20px; background:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer; font-size:16px;">
+            🎤 ابدأ الاستماع
+        </button>
+        <button id="stop-voice" style="padding:10px 20px; background:#f44336; color:white; border:none; border-radius:5px; cursor:pointer; font-size:16px; display:none;">
+            ⏹️ إيقاف
+        </button>
+        <p id="voice-status" style="margin-top:10px; color:#666;"></p>
+        <p id="voice-result" style="font-size:18px; font-weight:bold; color:#2196F3;"></p>
+    </div>
+    
+    <script>
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'ar-MA';
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    
+    let isListening = false;
+    
+    document.getElementById('start-voice').addEventListener('click', function() {
+        recognition.start();
+        isListening = true;
+        document.getElementById('start-voice').style.display = 'none';
+        document.getElementById('stop-voice').style.display = 'inline-block';
+        document.getElementById('voice-status').innerText = '🎤 جاري الاستماع...';
+    });
+    
+    document.getElementById('stop-voice').addEventListener('click', function() {
+        recognition.stop();
+        isListening = false;
+        document.getElementById('start-voice').style.display = 'inline-block';
+        document.getElementById('stop-voice').style.display = 'none';
+        document.getElementById('voice-status').innerText = '';
+    });
+    
+    recognition.onresult = function(event) {
+        const last = event.results.length - 1;
+        const command = event.results[last][0].transcript.trim();
+        document.getElementById('voice-result').innerText = '🗣️ ' + command;
+        
+        if (command.includes('ضيف') || command.includes('أضف')) {
+            const inputs = window.parent.document.querySelectorAll('input');
+            inputs.forEach(input => {
+                if (input.getAttribute('aria-label') && input.getAttribute('aria-label').includes('باركود')) {
+                    const words = command.split(' ');
+                    const qtyIndex = words.findIndex(w => w === 'كمية' || w === 'الكمية');
+                    if (qtyIndex >= 0 && words[qtyIndex + 1]) {
+                        const qtyInput = window.parent.document.querySelector('input[aria-label*="كمية"]');
+                        if (qtyInput) {
+                            qtyInput.value = words[qtyIndex + 1];
+                            qtyInput.dispatchEvent(new Event('input', {bubbles: true}));
+                        }
+                    }
+                }
+            });
+        } else if (command.includes('طبع') || command.includes('اطبع') || command.includes('فاتورة')) {
+            const buttons = window.parent.document.querySelectorAll('button');
+            buttons.forEach(btn => {
+                if (btn.innerText.includes('فاتورة') || btn.innerText.includes('Facture') || btn.innerText.includes('طباعة')) {
+                    btn.click();
+                }
+            });
+        } else if (command.includes('تأكيد') || command.includes('بيع')) {
+            const buttons = window.parent.document.querySelectorAll('button');
+            buttons.forEach(btn => {
+                if (btn.innerText.includes('تأكيد') || btn.innerText.includes('تسجيل')) {
+                    btn.click();
+                }
+            });
+        } else if (command.includes('سير')) {
+            const pageMap = {
+                'لوحة التحكم': '📊 لوحة التحكم',
+                'نقطة البيع': '🛒 نقطة البيع',
+                'المخزون': '📦 إدارة المخزون',
+                'الطباعة': '🖨️ الطباعة',
+                'الخزينة': '💰 الخزينة',
+                'الديون': '💳 الديون',
+                'الفواتير': '📄 الفواتير',
+                'الطلبيات': '📋 طلبيات الموردين',
+                'الخدمات': '🔧 الخدمات الإلكترونية',
+                'الأدوات': '🔗 أدوات سريعة'
+            };
+            for (const [key, value] of Object.entries(pageMap)) {
+                if (command.includes(key)) {
+                    const selects = window.parent.document.querySelectorAll('select');
+                    selects.forEach(select => {
+                        if (select.id && select.id.includes('menu_main')) {
+                            select.value = value;
+                            select.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    });
+                    document.getElementById('voice-result').innerText = '🗣️ ' + command + ' → ' + value;
+                    break;
+                }
+            }
+        }
+    };
+    
+    recognition.onerror = function(event) {
+        document.getElementById('voice-status').innerText = '❌ خطأ: ' + event.error;
+    };
+    </script>
+    """
+    components.html(voice_html, height=150)
 
 # ==================== نظام الترجمة ==================== #
 if "lang" not in st.session_state:
@@ -956,6 +1109,46 @@ translations = {
         "ar": "تفعيل الإشعارات",
         "fr": "Activer les notifications",
         "en": "Enable Notifications"
+    },
+    "printer_settings": {
+        "ar": "🖨️ إعدادات الطابعة",
+        "fr": "🖨️ Paramètres d'impression",
+        "en": "🖨️ Printer Settings"
+    },
+    "printer_type_label": {
+        "ar": "نوع الطابعة:",
+        "fr": "Type d'imprimante:",
+        "en": "Printer Type:"
+    },
+    "printer_thermal": {
+        "ar": "حرارية 80mm (فواتير صغيرة)",
+        "fr": "Thermique 80mm (petites factures)",
+        "en": "Thermal 80mm (small invoices)"
+    },
+    "printer_normal": {
+        "ar": "عادية A4 (فواتير كبيرة)",
+        "fr": "Normale A4 (grandes factures)",
+        "en": "Normal A4 (large invoices)"
+    },
+    "scanner_settings": {
+        "ar": "📷 إعدادات الماسح",
+        "fr": "📷 Paramètres du scanner",
+        "en": "📷 Scanner Settings"
+    },
+    "scanner_type_label": {
+        "ar": "نوع الماسح:",
+        "fr": "Type de scanner:",
+        "en": "Scanner Type:"
+    },
+    "scanner_camera": {
+        "ar": "كاميرا الهاتف (مسح بصري)",
+        "fr": "Caméra du téléphone (scan optique)",
+        "en": "Phone Camera (optical scan)"
+    },
+    "scanner_usb": {
+        "ar": "ماسح باركود USB",
+        "fr": "Scanner code-barres USB",
+        "en": "USB Barcode Scanner"
     },
     "update_info_button": {
         "ar": "💾 تحديث المعلومات والإعدادات",
@@ -1847,20 +2040,12 @@ def to_excel(df):
 def import_excel_data(uploaded_file, table_name, user_id):
     try:
         df = pd.read_excel(uploaded_file)
-        conn = get_connection()
-        cursor = conn.cursor()
         for _, row in df.iterrows():
             data_dict = row.to_dict()
             if 'id' in data_dict:
                 del data_dict['id']
             data_dict['user_id'] = user_id
-            columns = ', '.join(data_dict.keys())
-            placeholders = ', '.join(['?' for _ in data_dict])
-            values = list(data_dict.values())
-            query = f'INSERT INTO {table_name} ({columns}) VALUES ({placeholders})'
-            cursor.execute(query, values)
-        conn.commit()
-        conn.close()
+            save_to_table(table_name, data_dict, user_id)
         return True
     except Exception as e:
         st.error(f"Erreur import: {str(e)}")
@@ -1897,452 +2082,37 @@ def display_business_header(user_info):
         col1, col2, col3, col4 = st.columns([1, 2, 2, 1])
         
         with col1:
-            if user_info[8] and os.path.exists(user_info[8]):
+            if user_info.get('logo_path') and os.path.exists(user_info['logo_path']):
                 try:
-                    st.image(user_info[8], width=60)
+                    st.image(user_info['logo_path'], width=60)
                 except:
                     pass
         
         with col2:
-            business_name = user_info[4] if user_info[4] else "اسم المكتب"
-            full_name = user_info[3] if user_info[3] else ""
+            business_name = user_info.get('business_name', 'اسم المكتب')
+            full_name = user_info.get('full_name', '')
             st.markdown(f"### 🏢 {business_name}")
             if full_name:
                 st.markdown(f"👤 **{full_name}**")
         
         with col3:
-            phone = user_info[5] if user_info[5] else ""
-            email = user_info[6] if user_info[6] else ""
+            phone = user_info.get('business_phone', '')
+            email = user_info.get('business_email', '')
             if phone:
                 st.markdown(f"📞 {phone}")
             if email:
                 st.markdown(f"📧 {email}")
         
         with col4:
-            position = user_info[7] if user_info[7] else ""
+            position = user_info.get('position', '')
             if position:
                 st.markdown(f"💼 {position}")
+            printer = "🖨️ حرارية" if user_info.get('printer_type') == "thermal" else "🖨️ عادية"
+            scanner = "📷 كاميرا" if user_info.get('scanner_type') == "camera" else "🔌 USB"
+            st.markdown(f"{printer} | {scanner}")
             st.markdown(f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
         
         st.divider()
-
-# ==================== دوال الماسح ==================== #
-def mobile_barcode_scanner(session_key):
-    scanner_html = f"""
-    <div id="barcode-scanner-container" style="width:100%; min-height:350px; border:2px dashed #4CAF50; border-radius:10px; padding:15px; background:#f9f9f9;">
-        <div id="reader" style="width:100%; min-height:300px;"></div>
-        <p style="text-align:center; color:#666; font-size:14px; margin-top:10px;">📱 قرب الباركود من الكاميرا</p>
-        <div id="scan-status" style="text-align:center; font-size:14px; color:#999; margin-top:5px;">⏳ جاري تهيئة الكاميرا...</div>
-    </div>
-    
-    <script src="https://unpkg.com/html5-qrcode"></script>
-    <script>
-    (function() {{
-        'use strict';
-        
-        let html5Qrcode = null;
-        let isScanning = false;
-        let scannerStarted = false;
-        let lastScanned = '';
-        let retryCount = 0;
-        const maxRetries = 3;
-        
-        function updateStatus(message, isSuccess = false, isError = false) {{
-            const statusEl = document.getElementById('scan-status');
-            if (statusEl) {{
-                statusEl.textContent = message;
-                statusEl.style.color = isError ? '#f44336' : (isSuccess ? '#4CAF50' : '#666');
-            }}
-        }}
-        
-        function setInputValue(value) {{
-            let input = document.getElementById('{session_key}');
-            if (!input) {{
-                const inputs = document.getElementsByName('{session_key}');
-                if (inputs.length > 0) input = inputs[0];
-            }}
-            if (!input) {{
-                const inputs = document.querySelectorAll('input[aria-label="{session_key}"]');
-                if (inputs.length > 0) input = inputs[0];
-            }}
-            if (!input) {{
-                const allInputs = document.querySelectorAll('input');
-                for (let el of allInputs) {{
-                    if (el.placeholder && (el.placeholder.includes('باركود') || el.placeholder.includes('barcode') || el.placeholder.includes('Code'))) {{
-                        input = el;
-                        break;
-                    }}
-                }}
-            }}
-            if (input) {{
-                input.value = value;
-                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                input.style.background = '#a5d6a7';
-                input.style.border = '3px solid #4CAF50';
-                input.style.transition = 'all 0.3s';
-                setTimeout(() => {{
-                    input.style.background = '';
-                    input.style.border = '';
-                }}, 1500);
-                return true;
-            }}
-            return false;
-        }}
-        
-        function sendToStreamlit(value) {{
-            window.parent.postMessage({{
-                type: 'streamlit:setComponentValue',
-                key: '{session_key}',
-                value: value
-            }}, '*');
-            setTimeout(() => {{
-                window.parent.postMessage({{
-                    type: 'streamlit:setComponentValue',
-                    key: '{session_key}',
-                    value: value
-                }}, '*');
-            }}, 50);
-            setTimeout(() => {{
-                window.parent.postMessage({{
-                    type: 'streamlit:setComponentValue',
-                    key: '{session_key}',
-                    value: value
-                }}, '*');
-            }}, 200);
-        }}
-        
-        function handleSuccessfulScan(decodedText) {{
-            if (decodedText === lastScanned) return;
-            lastScanned = decodedText;
-            updateStatus('✅ تم المسح: ' + decodedText, true);
-            setInputValue(decodedText);
-            sendToStreamlit(decodedText);
-            if (html5Qrcode) {{
-                html5Qrcode.stop().then(() => {{
-                    isScanning = false;
-                    scannerStarted = false;
-                    updateStatus('📸 جاهز للمسح مرة أخرى', false);
-                    setTimeout(() => {{
-                        lastScanned = '';
-                        startScanner();
-                    }}, 2000);
-                }}).catch(function(err) {{
-                    console.warn('Stop error:', err);
-                    isScanning = false;
-                    scannerStarted = false;
-                    setTimeout(() => {{
-                        lastScanned = '';
-                        startScanner();
-                    }}, 2000);
-                }});
-            }}
-            window.parent.postMessage({{
-                type: 'streamlit:setComponentValue',
-                key: '{session_key}',
-                value: decodedText
-            }}, '*');
-        }}
-        
-        function startScanner() {{
-            if (isScanning || scannerStarted) return;
-            const container = document.getElementById('barcode-scanner-container');
-            if (!container) return;
-            try {{
-                if (html5Qrcode) {{
-                    html5Qrcode.clear();
-                    html5Qrcode = null;
-                }}
-                const readerElement = document.getElementById('reader');
-                if (!readerElement) return;
-                html5Qrcode = new Html5Qrcode("reader");
-                scannerStarted = true;
-                const config = {{
-                    fps: 15,
-                    qrbox: {{width: 280, height: 280}},
-                    aspectRatio: 1.0,
-                    facingMode: "environment"
-                }};
-                updateStatus('📷 جاري تشغيل الكاميرا...', false);
-                html5Qrcode.start(
-                    {{ facingMode: "environment" }},
-                    config,
-                    function(decodedText, decodedResult) {{
-                        if (decodedText) {{
-                            handleSuccessfulScan(decodedText);
-                        }}
-                    }},
-                    function(errorMessage) {{}}
-                ).then(function() {{
-                    isScanning = true;
-                    updateStatus('📷 الكاميرا شغالة - امسح الباركود', false);
-                }}).catch(function(err) {{
-                    console.error('Scanner start error:', err);
-                    updateStatus('❌ خطأ: ' + err.message, false, true);
-                    scannerStarted = false;
-                    retryCount++;
-                    if (retryCount < maxRetries) {{
-                        setTimeout(startScanner, 2000);
-                    }} else {{
-                        updateStatus('❌ تعذر تشغيل الكاميرا بعد ' + maxRetries + ' محاولات', false, true);
-                    }}
-                }});
-            }} catch(e) {{
-                console.error('Scanner error:', e);
-                updateStatus('❌ خطأ: ' + e.message, false, true);
-                scannerStarted = false;
-                retryCount++;
-                if (retryCount < maxRetries) {{
-                    setTimeout(startScanner, 2000);
-                }}
-            }}
-        }}
-        setTimeout(startScanner, 1000);
-        document.addEventListener('visibilitychange', function() {{
-            if (!document.hidden && !isScanning && !scannerStarted) {{
-                retryCount = 0;
-                setTimeout(startScanner, 500);
-            }}
-        }});
-    }})();
-    </script>
-    """
-    components.html(scanner_html, height=420)
-
-def fast_barcode_scanner_with_qty(input_label, qty_label):
-    scanner_html = f"""
-    <div id="reader" style="width:100%"></div>
-    <script src="https://unpkg.com/html5-qrcode"></script>
-    <script>
-    function onScanSuccess(decodedText, decodedResult) {{
-        const inputs = window.parent.document.querySelectorAll('input');
-        let codeInput = null;
-        let qtyInput = null;
-        inputs.forEach(input => {{
-            if (input.getAttribute('aria-label') === '{input_label}') {{
-                codeInput = input;
-            }}
-            if (input.getAttribute('aria-label') === '{qty_label}') {{
-                qtyInput = input;
-            }}
-        }});
-        if (codeInput) {{
-            codeInput.value = decodedText;
-            codeInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            codeInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        }}
-        if (qtyInput && !qtyInput.value) {{
-            qtyInput.value = '1';
-            qtyInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            qtyInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        }}
-    }}
-    let html5QrcodeScanner = new Html5QrcodeScanner("reader", {{ fps: 10, qrbox: 250, facingMode: "environment" }});
-    html5QrcodeScanner.render(onScanSuccess);
-    </script>
-    """
-    components.html(scanner_html, height=400)
-
-def auto_sale_scanner():
-    scanner_html = """
-    <div id="reader" style="width:100%"></div>
-    <script src="https://unpkg.com/html5-qrcode"></script>
-    <script>
-    let lastScan = '';
-    let scanTimeout;
-    function onScanSuccess(decodedText, decodedResult) {
-        if (decodedText !== lastScan) {
-            lastScan = decodedText;
-            clearTimeout(scanTimeout);
-            scanTimeout = setTimeout(() => { lastScan = ''; }, 2000);
-            const inputs = window.parent.document.querySelectorAll('input');
-            inputs.forEach(input => {
-                if (input.getAttribute('aria-label') === 'Auto-Scan') {
-                    input.value = decodedText;
-                    input.dispatchEvent(new Event('input', {bubbles: true}));
-                    input.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-            });
-        }
-    }
-    let html5QrcodeScanner = new Html5QrcodeScanner("reader", {fps: 10, qrbox: 250, facingMode: "environment"});
-    html5QrcodeScanner.render(onScanSuccess);
-    </script>
-    """
-    components.html(scanner_html, height=350)
-
-def auto_cart_scanner():
-    scanner_html = """
-    <div id="auto_cart_reader" style="width:100%"></div>
-    <script src="https://unpkg.com/html5-qrcode"></script>
-    <script>
-    let lastCartScan = '';
-    let cartScanTimeout;
-    function onScanSuccess(decodedText, decodedResult) {
-        if (decodedText !== lastCartScan) {
-            lastCartScan = decodedText;
-            clearTimeout(cartScanTimeout);
-            cartScanTimeout = setTimeout(() => { lastCartScan = ''; }, 1500);
-            const inputs = window.parent.document.querySelectorAll('input');
-            inputs.forEach(input => {
-                if (input.getAttribute('aria-label') === 'Auto-Cart-Scan') {
-                    input.value = decodedText;
-                    input.dispatchEvent(new Event('input', {bubbles: true}));
-                    input.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-            });
-        }
-    }
-    let html5QrcodeScanner = new Html5QrcodeScanner("auto_cart_reader", {fps: 10, qrbox: 250, facingMode: "environment"});
-    html5QrcodeScanner.render(onScanSuccess);
-    </script>
-    """
-    components.html(scanner_html, height=300)
-
-def stock_barcode_scanner(target_input_label):
-    scanner_html = f"""
-    <div id="stock_reader" style="width:100%"></div>
-    <script src="https://unpkg.com/html5-qrcode"></script>
-    <script>
-    let lastStockScan = '';
-    let stockScanTimeout;
-    
-    function onScanSuccess(decodedText, decodedResult) {{
-        if (decodedText !== lastStockScan) {{
-            lastStockScan = decodedText;
-            clearTimeout(stockScanTimeout);
-            stockScanTimeout = setTimeout(() => {{ lastStockScan = ''; }}, 2000);
-            
-            const inputs = window.parent.document.querySelectorAll('input');
-            inputs.forEach(function(input) {{
-                if (input.getAttribute('aria-label') === '{target_input_label}') {{
-                    input.value = decodedText;
-                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    input.style.background = '#e8f5e9';
-                    setTimeout(() => {{ input.style.background = ''; }}, 500);
-                }}
-            }});
-        }}
-    }}
-    
-    let html5QrcodeScanner = new Html5QrcodeScanner(
-        "stock_reader", 
-        {{fps: 10, qrbox: 250, facingMode: "environment"}}
-    );
-    html5QrcodeScanner.render(onScanSuccess);
-    </script>
-    """
-    components.html(scanner_html, height=300)
-
-# ==================== نظام التحكم الصوتي ==================== #
-def voice_command_component():
-    voice_html = """
-    <div id="voice-control">
-        <button id="start-voice" style="padding:10px 20px; background:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer; font-size:16px;">
-            🎤 ابدأ الاستماع
-        </button>
-        <button id="stop-voice" style="padding:10px 20px; background:#f44336; color:white; border:none; border-radius:5px; cursor:pointer; font-size:16px; display:none;">
-            ⏹️ إيقاف
-        </button>
-        <p id="voice-status" style="margin-top:10px; color:#666;"></p>
-        <p id="voice-result" style="font-size:18px; font-weight:bold; color:#2196F3;"></p>
-    </div>
-    
-    <script>
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const recognition = new SpeechRecognition();
-    recognition.lang = 'ar-MA';
-    recognition.continuous = true;
-    recognition.interimResults = false;
-    
-    let isListening = false;
-    
-    document.getElementById('start-voice').addEventListener('click', function() {
-        recognition.start();
-        isListening = true;
-        document.getElementById('start-voice').style.display = 'none';
-        document.getElementById('stop-voice').style.display = 'inline-block';
-        document.getElementById('voice-status').innerText = '🎤 جاري الاستماع...';
-    });
-    
-    document.getElementById('stop-voice').addEventListener('click', function() {
-        recognition.stop();
-        isListening = false;
-        document.getElementById('start-voice').style.display = 'inline-block';
-        document.getElementById('stop-voice').style.display = 'none';
-        document.getElementById('voice-status').innerText = '';
-    });
-    
-    recognition.onresult = function(event) {
-        const last = event.results.length - 1;
-        const command = event.results[last][0].transcript.trim();
-        document.getElementById('voice-result').innerText = '🗣️ ' + command;
-        
-        if (command.includes('ضيف') || command.includes('أضف')) {
-            const inputs = window.parent.document.querySelectorAll('input');
-            inputs.forEach(input => {
-                if (input.getAttribute('aria-label') && input.getAttribute('aria-label').includes('باركود')) {
-                    const words = command.split(' ');
-                    const qtyIndex = words.findIndex(w => w === 'كمية' || w === 'الكمية');
-                    if (qtyIndex >= 0 && words[qtyIndex + 1]) {
-                        const qtyInput = window.parent.document.querySelector('input[aria-label*="كمية"]');
-                        if (qtyInput) {
-                            qtyInput.value = words[qtyIndex + 1];
-                            qtyInput.dispatchEvent(new Event('input', {bubbles: true}));
-                        }
-                    }
-                }
-            });
-        } else if (command.includes('طبع') || command.includes('اطبع') || command.includes('فاتورة')) {
-            const buttons = window.parent.document.querySelectorAll('button');
-            buttons.forEach(btn => {
-                if (btn.innerText.includes('فاتورة') || btn.innerText.includes('Facture') || btn.innerText.includes('طباعة')) {
-                    btn.click();
-                }
-            });
-        } else if (command.includes('تأكيد') || command.includes('بيع')) {
-            const buttons = window.parent.document.querySelectorAll('button');
-            buttons.forEach(btn => {
-                if (btn.innerText.includes('تأكيد') || btn.innerText.includes('تسجيل')) {
-                    btn.click();
-                }
-            });
-        } else if (command.includes('سير')) {
-            const pageMap = {
-                'لوحة التحكم': '📊 لوحة التحكم',
-                'نقطة البيع': '🛒 نقطة البيع',
-                'المخزون': '📦 إدارة المخزون',
-                'الطباعة': '🖨️ الطباعة',
-                'الخزينة': '💰 الخزينة',
-                'الديون': '💳 الديون',
-                'الفواتير': '📄 الفواتير',
-                'الطلبيات': '📋 طلبيات الموردين',
-                'الخدمات': '🔧 الخدمات الإلكترونية',
-                'الأدوات': '🔗 أدوات سريعة'
-            };
-            for (const [key, value] of Object.entries(pageMap)) {
-                if (command.includes(key)) {
-                    const selects = window.parent.document.querySelectorAll('select');
-                    selects.forEach(select => {
-                        if (select.id && select.id.includes('menu_main')) {
-                            select.value = value;
-                            select.dispatchEvent(new Event('change', {bubbles: true}));
-                        }
-                    });
-                    document.getElementById('voice-result').innerText = '🗣️ ' + command + ' → ' + value;
-                    break;
-                }
-            }
-        }
-    };
-    
-    recognition.onerror = function(event) {
-        document.getElementById('voice-status').innerText = '❌ خطأ: ' + event.error;
-    };
-    </script>
-    """
-    components.html(voice_html, height=150)
 
 # ==================== الحالة والتسجيل ==================== #
 if "authenticated" not in st.session_state:
@@ -2412,7 +2182,7 @@ if not st.session_state.authenticated:
                         user = check_user(username, password)
                         if user:
                             st.session_state.authenticated = True
-                            st.session_state.user_id = user[0]
+                            st.session_state.user_id = user['id']
                             st.session_state.user_info = user
                             st.rerun()
                         else:
@@ -2477,10 +2247,10 @@ with st.sidebar:
     
     if st.session_state.user_info:
         user = st.session_state.user_info
-        if user[3]:
-            st.success(f"👤 {user[3]}")
-        if user[4]:
-            st.info(f"🏢 {user[4]}")
+        if user.get('full_name'):
+            st.success(f"👤 {user['full_name']}")
+        if user.get('business_name'):
+            st.info(f"🏢 {user['business_name']}")
     
     st.divider()
     
@@ -2508,14 +2278,14 @@ with st.sidebar:
         st.subheader(t("business_info"))
         user = st.session_state.user_info
         
-        new_fullname = st.text_input(t("full_name_label"), value=user[3] if user[3] else "", key="edit_fullname")
-        new_business_name = st.text_input(t("business_name_label"), value=user[4] if user[4] else "", key="edit_business_name")
-        new_business_phone = st.text_input(t("business_phone_label"), value=user[5] if user[5] else "", key="edit_business_phone")
-        new_business_email = st.text_input(t("business_email_label"), value=user[6] if user[6] else "", key="edit_business_email")
-        new_position = st.text_input(t("position_label"), value=user[7] if user[7] else "", key="edit_position")
+        new_fullname = st.text_input(t("full_name_label"), value=user.get('full_name', ''), key="edit_fullname")
+        new_business_name = st.text_input(t("business_name_label"), value=user.get('business_name', ''), key="edit_business_name")
+        new_business_phone = st.text_input(t("business_phone_label"), value=user.get('business_phone', ''), key="edit_business_phone")
+        new_business_email = st.text_input(t("business_email_label"), value=user.get('business_email', ''), key="edit_business_email")
+        new_position = st.text_input(t("position_label"), value=user.get('position', ''), key="edit_position")
         
         uploaded_logo = st.file_uploader(t("logo_label"), type=["png", "jpg", "jpeg"], key="logo_upload")
-        logo_path = user[8] if user[8] else ""
+        logo_path = user.get('logo_path', '')
         
         if uploaded_logo:
             logo_dir = "logos"
@@ -2531,14 +2301,14 @@ with st.sidebar:
         discount_type = st.selectbox(
             t("discount_type_label"),
             ["percentage", "fixed"],
-            index=0 if user[10] == "percentage" else 1,
+            index=0 if user.get('discount_type') == "percentage" else 1,
             key="edit_discount_type"
         )
         discount_value = st.number_input(
             t("discount_value_label"),
             min_value=0.0,
             max_value=100.0 if discount_type == "percentage" else 10000.0,
-            value=float(user[11]) if user[11] else 0.0,
+            value=float(user.get('discount_value', 0)),
             step=1.0,
             key="edit_discount_value"
         )
@@ -2548,14 +2318,32 @@ with st.sidebar:
         st.subheader(t("notification_settings"))
         notification_enabled = st.checkbox(
             t("enable_notifications"),
-            value=bool(user[9]) if user[9] else True,
+            value=bool(user.get('notification_enabled', 1)),
             key="edit_notification_enabled"
         )
         
         st.divider()
         
+        st.subheader(t("printer_settings"))
+        printer_type = st.selectbox(
+            t("printer_type_label"),
+            ["thermal", "normal"],
+            index=0 if user.get('printer_type') == "thermal" else 1,
+            key="edit_printer_type"
+        )
+        
+        st.subheader(t("scanner_settings"))
+        scanner_type = st.selectbox(
+            t("scanner_type_label"),
+            ["camera", "usb"],
+            index=0 if user.get('scanner_type') == "camera" else 1,
+            key="edit_scanner_type"
+        )
+        
+        st.divider()
+        
         if st.button(t("update_info_button"), use_container_width=True):
-            update_user_info(
+            if update_user_info(
                 st.session_state.user_id,
                 new_fullname,
                 new_business_name,
@@ -2565,11 +2353,13 @@ with st.sidebar:
                 logo_path,
                 1 if notification_enabled else 0,
                 discount_type,
-                discount_value
-            )
-            st.session_state.user_info = get_user_info(st.session_state.user_id)
-            st.success(t("info_updated"))
-            st.rerun()
+                discount_value,
+                printer_type,
+                scanner_type
+            ):
+                st.session_state.user_info = get_user_info(st.session_state.user_id)
+                st.success(t("info_updated"))
+                st.rerun()
     
     st.divider()
     
@@ -2788,8 +2578,8 @@ if menu == t("pos"):
     user_id = st.session_state.user_id
     user_info = st.session_state.user_info
     
-    user_discount_type = user_info[10] if user_info and len(user_info) > 10 else "percentage"
-    user_discount_value = user_info[11] if user_info and len(user_info) > 11 else 0
+    user_discount_type = user_info.get('discount_type', 'percentage')
+    user_discount_value = user_info.get('discount_value', 0)
     
     with st.expander(t("voice_command"), expanded=False):
         voice_command_component()
@@ -2888,7 +2678,15 @@ if menu == t("pos"):
     else:
         use_scanner = st.checkbox(t("activate_scanner"))
         if use_scanner:
-            fast_barcode_scanner_with_qty(t("barcode"), t("quantity"))
+            scanner_type = user_info.get('scanner_type', 'camera')
+            if scanner_type == "camera":
+                fast_barcode_scanner_with_qty(t("barcode"), t("quantity"))
+            else:
+                # ماسح USB
+                st.info("🔌 قم بتوصيل ماسح الباركود USB وامسح المنتج")
+                usb_code = st.text_input("الباركود", key="usb_barcode_input", placeholder="امسح الباركود...")
+                if usb_code:
+                    st.session_state.scanned_barcode = usb_code
         
         mode = st.radio(
             t("sale_type"),
@@ -3146,8 +2944,15 @@ if menu == t("pos"):
                     
                     use_cart_scanner = st.checkbox("📷 تفعيل الماسح التلقائي", key="cart_scanner_toggle")
                     if use_cart_scanner:
-                        st.info("📷 امسح الباركود الآن - سيتم كتابته تلقائياً")
-                        mobile_barcode_scanner("panier_code")
+                        scanner_type = user_info.get('scanner_type', 'camera')
+                        if scanner_type == "camera":
+                            st.info("📷 امسح الباركود الآن - سيتم كتابته تلقائياً")
+                            mobile_barcode_scanner("panier_code")
+                        else:
+                            st.info("🔌 قم بتوصيل ماسح الباركود USB وامسح المنتج")
+                            usb_code = st.text_input("الباركود", key="usb_cart_input", placeholder="امسح الباركود...")
+                            if usb_code:
+                                st.session_state.scanned_barcode = usb_code
                     
                     code = st.text_input(t("barcode"), key="panier_code")
                     qty = st.number_input(f"{t('quantity')}:", min_value=0.0, step=0.1, key="panier_qty")
@@ -3391,8 +3196,15 @@ elif menu == t("stock"):
     with st.expander(t("add_product"), expanded=True):
         use_add_scanner = st.checkbox(t("stock_scanner_add"), key="add_scanner_checkbox")
         if use_add_scanner:
-            st.info("📸 امسح الباركود الآن - سيتم كتابته تلقائياً في خانة الباركود")
-            mobile_barcode_scanner("stock_barcode")
+            scanner_type = st.session_state.user_info.get('scanner_type', 'camera')
+            if scanner_type == "camera":
+                st.info("📸 امسح الباركود الآن - سيتم كتابته تلقائياً في خانة الباركود")
+                mobile_barcode_scanner("stock_barcode")
+            else:
+                st.info("🔌 قم بتوصيل ماسح الباركود USB وامسح المنتج")
+                usb_code = st.text_input("الباركود", key="usb_stock_input", placeholder="امسح الباركود...")
+                if usb_code:
+                    st.session_state.scanned_barcode = usb_code
         
         col1, col2, col3, col4 = st.columns(4)
         with col1: 
@@ -3407,16 +3219,18 @@ elif menu == t("stock"):
         if st.button(t("add_button"), key="stock_add_btn"):
             if name:
                 try:
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO stock (user_id, Nom, Prix, Quantité, "Code-barres", alert_threshold)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (user_id, name, float(price), float(qty), barcode if barcode else "", 5))
-                    conn.commit()
-                    conn.close()
-                    st.success(t("product_added"))
-                    st.rerun()
+                    result = save_to_table("stock", {
+                        "Nom": name,
+                        "Prix": float(price),
+                        "Quantité": float(qty),
+                        "Code-barres": barcode if barcode else "",
+                        "alert_threshold": 5
+                    }, user_id)
+                    if result:
+                        st.success(t("product_added"))
+                        st.rerun()
+                    else:
+                        st.error("❌ خطأ في إضافة المنتج")
                 except Exception as e:
                     st.error(f"❌ خطأ: {str(e)}")
             else:
@@ -3446,8 +3260,15 @@ elif menu == t("stock"):
         with st.expander(t("update_product")):
             use_update_scanner = st.checkbox(t("stock_scanner_update"), key="update_scanner_checkbox")
             if use_update_scanner:
-                st.info("📸 امسح الباركود الآن - سيتم كتابته تلقائياً في خانة الباركود")
-                mobile_barcode_scanner("stock_update_barcode")
+                scanner_type = st.session_state.user_info.get('scanner_type', 'camera')
+                if scanner_type == "camera":
+                    st.info("📸 امسح الباركود الآن - سيتم كتابته تلقائياً في خانة الباركود")
+                    mobile_barcode_scanner("stock_update_barcode")
+                else:
+                    st.info("🔌 قم بتوصيل ماسح الباركود USB وامسح المنتج")
+                    usb_code = st.text_input("الباركود", key="usb_stock_update_input", placeholder="امسح الباركود...")
+                    if usb_code:
+                        st.session_state.scanned_barcode = usb_code
             
             selected_product = st.selectbox(
                 t("select_product"), 
@@ -3484,15 +3305,11 @@ elif menu == t("stock"):
                 
                 if st.button(t("update_button"), key="stock_update_btn"):
                     try:
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            UPDATE stock 
-                            SET Quantité = ?, Prix = ?, "Code-barres" = ?
-                            WHERE id = ? AND user_id = ?
-                        ''', (new_qty, new_price, new_barcode if new_barcode else "", product_data['id'], user_id))
-                        conn.commit()
-                        conn.close()
+                        update_table("stock", {
+                            "Quantité": new_qty,
+                            "Prix": new_price,
+                            "Code-barres": new_barcode if new_barcode else ""
+                        }, product_data['id'], user_id)
                         st.success(t("product_updated"))
                         st.rerun()
                     except Exception as e:
@@ -4300,7 +4117,6 @@ elif menu == t("inventory_management"):
         if not df_inventory.empty:
             st.dataframe(df_inventory[['product_name', 'system_quantity', 'physical_quantity', 'difference', 'status', 'date']], use_container_width=True)
             
-            # تحديث الكميات الفعلية
             st.subheader("✏️ تحديث الكميات الفعلية")
             inventory_id = st.selectbox(
                 "اختر المنتج",
@@ -4321,7 +4137,6 @@ elif menu == t("inventory_management"):
                         st.success("✅ تم تحديث الكمية بنجاح")
                         st.rerun()
             
-            # عرض ملخص الفروقات
             st.subheader("📊 ملخص الفروقات")
             diff_summary = df_inventory.groupby('status')['difference'].agg(['count', 'sum']).reset_index()
             if not diff_summary.empty:
@@ -4330,7 +4145,6 @@ elif menu == t("inventory_management"):
                 total_diff = df_inventory['difference'].sum()
                 st.metric("إجمالي الفرق", f"{total_diff:.2f}")
             
-            # تصدير تقرير الجرد
             st.download_button(
                 "📥 تحميل تقرير الجرد (Excel)",
                 data=to_excel(df_inventory),
@@ -4346,7 +4160,6 @@ elif menu == t("financial_analysis"):
     
     user_id = st.session_state.user_id
     
-    # حساب التحليل المالي الحالي
     analysis = calculate_financial_analysis(user_id)
     
     if analysis:
@@ -4362,19 +4175,16 @@ elif menu == t("financial_analysis"):
         
         st.divider()
         
-        # حفظ التحليل
         if st.button("💾 حفظ التحليل المالي"):
             if save_financial_analysis(user_id):
                 st.success("✅ تم حفظ التحليل المالي")
                 st.rerun()
     
-    # عرض التحليلات السابقة
     st.subheader("📊 التحليلات السابقة")
     df_analysis = get_df("financial_analysis", user_id)
     if not df_analysis.empty:
         st.dataframe(df_analysis, use_container_width=True)
         
-        # رسم بياني للتحليل المالي
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['total_sales'], name='المبيعات', line=dict(color='blue')))
         fig.add_trace(go.Scatter(x=df_analysis['date'], y=df_analysis['total_profit'], name='الأرباح', line=dict(color='green')))
@@ -4382,7 +4192,6 @@ elif menu == t("financial_analysis"):
         fig.update_layout(title="تطور المؤشرات المالية", xaxis_title="التاريخ", yaxis_title="المبلغ (DH)")
         st.plotly_chart(fig, use_container_width=True)
         
-        # تصدير التحليل
         st.download_button(
             "📥 تحميل التحليل المالي (Excel)",
             data=to_excel(df_analysis),
@@ -4412,7 +4221,7 @@ elif menu == t("backup_restore"):
                             "📥 تحميل النسخة الاحتياطية",
                             f,
                             os.path.basename(backup_file),
-                            mime="application/zip"
+                            mime="application/json"
                         )
                 else:
                     st.error("❌ حدث خطأ في إنشاء النسخة الاحتياطية")
@@ -4421,15 +4230,14 @@ elif menu == t("backup_restore"):
         st.subheader(t("restore_backup"))
         uploaded_backup = st.file_uploader(
             t("restore_backup"),
-            type=["zip"],
+            type=["json"],
             key="backup_restore"
         )
         
         if uploaded_backup is not None:
             if st.button("🔄 " + t("restore_backup"), type="primary", use_container_width=True):
                 with st.spinner("جاري استعادة النسخة الاحتياطية..."):
-                    # حفظ الملف المؤقت
-                    temp_file = f"temp_restore_{user_id}.zip"
+                    temp_file = f"temp_restore_{user_id}.json"
                     with open(temp_file, "wb") as f:
                         f.write(uploaded_backup.getbuffer())
                     
@@ -4442,7 +4250,6 @@ elif menu == t("backup_restore"):
     
     st.divider()
     
-    # عرض النسخ الاحتياطية السابقة
     st.subheader("📋 النسخ الاحتياطية السابقة")
     backups = get_backup_files(user_id)
     if backups:
@@ -4460,7 +4267,7 @@ elif menu == t("backup_restore"):
                         "📥 تحميل",
                         f,
                         backup['name'],
-                        mime="application/zip",
+                        mime="application/json",
                         key=f"download_{backup['name']}"
                     )
     else:
