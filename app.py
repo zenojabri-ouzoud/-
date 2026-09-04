@@ -2148,7 +2148,7 @@ if "show_register" not in st.session_state:
 if "show_business_info" not in st.session_state:
     st.session_state.show_business_info = False
 
-# ==================== صفحة تسجيل الدخول ==================== #
+# ==================== تسجيل الدخول ==================== #
 if not st.session_state.authenticated:
     st.title("🏢 Gestion d'Entreprise")
     
@@ -2196,8 +2196,9 @@ if not st.session_state.authenticated:
                     st.rerun()
         
         with col2:
-            st.info("👤 المستخدم الافتراضي: version")
-            st.info("🔑 كلمة المرور: 123456789")
+            st.info("👤 المستخدمين المتاحين:")
+            st.info("🔑 version / 123456789")
+            st.info("🔑 soufiane / 2012-wac")
             st.info("📝 أو قم بإنشاء حساب جديد")
     
     else:
@@ -2682,7 +2683,6 @@ if menu == t("pos"):
             if scanner_type == "camera":
                 fast_barcode_scanner_with_qty(t("barcode"), t("quantity"))
             else:
-                # ماسح USB
                 st.info("🔌 قم بتوصيل ماسح الباركود USB وامسح المنتج")
                 usb_code = st.text_input("الباركود", key="usb_barcode_input", placeholder="امسح الباركود...")
                 if usb_code:
